@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -29,6 +29,9 @@ from metis.providers.router import ProviderRouter
 from metis.runtime.agent import MetisAgentRunner
 from metis.runtime.approval import ApprovalGate
 from metis.runtime.nodes import NodeConfig, NodeRouter
+from metis.runtime.system_metrics import collect_system_metrics
+from metis.runtime.usage import UsageTracker
+from metis.runtime.workbench_store import WorkbenchStore
 from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
 from metis.skills_engine.distiller import SkillDistiller
 from metis.skills_engine.loader import SkillRegistry
@@ -77,6 +80,34 @@ class NodeUpsertRequest(BaseModel):
 class ModelsUpdateRequest(BaseModel):
     providers: list[dict[str, Any]] | None = None
     roles: dict[str, dict[str, Any]] | None = None
+
+
+class TodoCreateRequest(BaseModel):
+    title: str
+    priority: str = "medium"
+
+
+class TodoPatchRequest(BaseModel):
+    done: bool | None = None
+
+
+class IdeaCreateRequest(BaseModel):
+    title: str
+    content: str = ""
+    tag: str = "general"
+
+
+class ChartCreateRequest(BaseModel):
+    title: str
+    chart_type: str = "bar"
+    labels: list[str]
+    values: list[float]
+
+
+class CronCreateRequest(BaseModel):
+    name: str
+    cron_expr: str
+    prompt: str = ""
 
 
 def build_default_router(config: MetisConfig) -> ProviderRouter:
@@ -145,6 +176,9 @@ def create_app(
         graph_dir=cfg.graph_dir,
         memory_config=models_registry.resolve_mnemosyne_config(cfg.memory),
     )
+    data_dir = cfg.home_dir / "data"
+    usage_tracker = UsageTracker(data_dir / "usage.jsonl")
+    store = WorkbenchStore(data_dir)
     backup_service = BackupService(cfg.backup)
     cron = CronHeartbeatService(enabled=cfg.cron_enabled)
 
@@ -160,6 +194,7 @@ def create_app(
         approval_gate=gate,
         skills=skills,
         node_router=node_router,
+        usage_tracker=usage_tracker,
     )
 
     @asynccontextmanager
@@ -182,6 +217,8 @@ def create_app(
     app.state.skills = skills
     app.state.memory = mnemosyne
     app.state.backup_service = backup_service
+    app.state.usage_tracker = usage_tracker
+    app.state.store = store
     app.state.cron = cron
     app.state.runner = runner
 
@@ -292,7 +329,118 @@ def create_app(
 
     @app.get("/api/cron")
     async def cron_status() -> dict[str, Any]:
-        return {"enabled": cron.enabled, "jobs": cron.list_jobs()}
+        return {
+            "enabled": cron.enabled,
+            "jobs": cron.list_jobs(),
+            "details": cron.jobs_detail(),
+        }
+
+    @app.post("/api/cron")
+    async def add_cron_job(body: CronCreateRequest) -> dict[str, Any]:
+        async def _custom_job(_name: str) -> None:
+            if body.prompt:
+                async for _ev in runner.run_stream(body.prompt):
+                    pass
+
+        cron.register(body.name, body.cron_expr, _custom_job)
+        return {"jobs": cron.list_jobs(), "details": cron.jobs_detail()}
+
+    @app.delete("/api/cron/{name}")
+    async def delete_cron_job(name: str) -> dict[str, Any]:
+        cron.unregister(name)
+        return {"jobs": cron.list_jobs(), "details": cron.jobs_detail()}
+
+    @app.post("/api/cron/{name}/run")
+    async def trigger_cron_job(name: str) -> dict[str, str]:
+        try:
+            await cron.trigger_now(name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown cron job: {name}") from exc
+        return {"status": "triggered", "name": name}
+
+    @app.get("/api/system/metrics")
+    async def system_metrics() -> dict[str, Any]:
+        return collect_system_metrics()
+
+    @app.get("/api/usage/summary")
+    async def usage_summary(days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
+        return usage_tracker.summary(days=days)
+
+    @app.get("/api/todos")
+    async def list_todos() -> dict[str, Any]:
+        return {"todos": store.list_todos()}
+
+    @app.post("/api/todos")
+    async def create_todo(body: TodoCreateRequest) -> dict[str, Any]:
+        return store.add_todo(body.title, priority=body.priority)
+
+    @app.patch("/api/todos/{todo_id}")
+    async def patch_todo(todo_id: str, body: TodoPatchRequest) -> dict[str, Any]:
+        try:
+            return store.toggle_todo(todo_id, done=body.done)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/todos/{todo_id}")
+    async def remove_todo(todo_id: str) -> dict[str, str]:
+        try:
+            store.delete_todo(todo_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": todo_id}
+
+    @app.get("/api/ideas")
+    async def list_ideas() -> dict[str, Any]:
+        return {"ideas": store.list_ideas()}
+
+    @app.post("/api/ideas")
+    async def create_idea(body: IdeaCreateRequest) -> dict[str, Any]:
+        return store.add_idea(body.title, content=body.content, tag=body.tag)
+
+    @app.delete("/api/ideas/{idea_id}")
+    async def remove_idea(idea_id: str) -> dict[str, str]:
+        try:
+            store.delete_idea(idea_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": idea_id}
+
+    @app.get("/api/charts")
+    async def list_charts() -> dict[str, Any]:
+        return {"charts": store.list_charts()}
+
+    @app.post("/api/charts")
+    async def create_chart(body: ChartCreateRequest) -> dict[str, Any]:
+        return store.add_chart(
+            title=body.title,
+            chart_type=body.chart_type,
+            labels=body.labels,
+            values=body.values,
+        )
+
+    @app.delete("/api/charts/{chart_id}")
+    async def remove_chart(chart_id: str) -> dict[str, str]:
+        try:
+            store.delete_chart(chart_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": chart_id}
+
+    @app.get("/api/memory/stats")
+    async def memory_stats() -> dict[str, Any]:
+        files = sorted(
+            p.name for p in mnemosyne.graph_dir.iterdir() if p.is_file()
+        )
+        return {"graph_dir": str(mnemosyne.graph_dir), "files_count": len(files), "files": files}
+
+    @app.post("/api/memory/upload")
+    async def upload_memory_file(file: Annotated[UploadFile, File()]) -> dict[str, str]:
+        safe_name = Path(file.filename or "upload.txt").name
+        dest = workspace.resolve_path(f"library/{safe_name}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(await file.read())
+        await mnemosyne.ingest_document(dest)
+        return {"status": "ingested", "filename": safe_name, "path": str(dest)}
 
     @app.get("/api/nodes")
     async def list_nodes() -> dict[str, Any]:

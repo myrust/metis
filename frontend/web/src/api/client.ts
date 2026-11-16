@@ -50,6 +50,74 @@ export interface ModelsPayload {
   >
 }
 
+export interface SystemMetrics {
+  platform: string
+  cpu_percent: number
+  cpu_count: number
+  memory_percent: number
+  memory_used_gb: number
+  memory_total_gb: number
+  disk_percent: number
+  disk_used_gb: number
+  disk_total_gb: number
+  disk_io: {
+    read_mb: number
+    write_mb: number
+    read_count: number
+    write_count: number
+  }
+  process_count: number
+  top_processes: Array<{
+    pid: number
+    name: string
+    cpu_percent: number
+    memory_percent: number
+  }>
+}
+
+export interface UsageSummary {
+  days: number
+  total_calls: number
+  total_input_tokens: number
+  total_output_tokens: number
+  total_cost_usd: number
+  by_model: Record<
+    string,
+    { calls: number; input_tokens: number; output_tokens: number; cost_usd: number }
+  >
+}
+
+export interface TodoItem {
+  id: string
+  title: string
+  done: boolean
+  priority: string
+  created_at: number
+}
+
+export interface IdeaItem {
+  id: string
+  title: string
+  content: string
+  tag: string
+  created_at: number
+}
+
+export interface CustomChartItem {
+  id: string
+  title: string
+  chart_type: string
+  labels: string[]
+  values: number[]
+}
+
+export interface CronDetail {
+  name: string
+  cron_expr: string
+  enabled: boolean
+  next_run: string
+}
+
 export interface SseEvent {
   event: 'thinking' | 'tool_call' | 'tool_result' | 'approval_required' | 'done'
   data: Record<string, unknown>
@@ -111,8 +179,61 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ text }),
     }),
-  cron: () => jsonFetch<{ enabled: boolean; jobs: string[] }>('/api/cron'),
-  runBackup: () => jsonFetch<{ status: string; archive?: string; reason?: string }>('/api/backup/run', { method: 'POST' }),
+  cron: () => jsonFetch<{ enabled: boolean; jobs: string[]; details: CronDetail[] }>('/api/cron'),
+  addCron: (name: string, cron_expr: string, prompt: string) =>
+    jsonFetch<{ jobs: string[]; details: CronDetail[] }>('/api/cron', {
+      method: 'POST',
+      body: JSON.stringify({ name, cron_expr, prompt }),
+    }),
+  deleteCron: (name: string) =>
+    jsonFetch<{ jobs: string[]; details: CronDetail[] }>(`/api/cron/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
+  triggerCron: (name: string) =>
+    jsonFetch<{ status: string }>(`/api/cron/${encodeURIComponent(name)}/run`, {
+      method: 'POST',
+    }),
+  runBackup: () =>
+    jsonFetch<{ status: string; archive?: string; reason?: string }>('/api/backup/run', {
+      method: 'POST',
+    }),
+  systemMetrics: () => jsonFetch<SystemMetrics>('/api/system/metrics'),
+  usageSummary: (days = 7) => jsonFetch<UsageSummary>(`/api/usage/summary?days=${days}`),
+  todos: () => jsonFetch<{ todos: TodoItem[] }>('/api/todos'),
+  addTodo: (title: string, priority = 'medium') =>
+    jsonFetch<TodoItem>('/api/todos', { method: 'POST', body: JSON.stringify({ title, priority }) }),
+  toggleTodo: (id: string, done?: boolean) =>
+    jsonFetch<TodoItem>(`/api/todos/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ done }),
+    }),
+  deleteTodo: (id: string) =>
+    jsonFetch<{ deleted: string }>(`/api/todos/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  ideas: () => jsonFetch<{ ideas: IdeaItem[] }>('/api/ideas'),
+  addIdea: (title: string, content = '', tag = 'general') =>
+    jsonFetch<IdeaItem>('/api/ideas', {
+      method: 'POST',
+      body: JSON.stringify({ title, content, tag }),
+    }),
+  deleteIdea: (id: string) =>
+    jsonFetch<{ deleted: string }>(`/api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  charts: () => jsonFetch<{ charts: CustomChartItem[] }>('/api/charts'),
+  addChart: (title: string, chart_type: string, labels: string[], values: number[]) =>
+    jsonFetch<CustomChartItem>('/api/charts', {
+      method: 'POST',
+      body: JSON.stringify({ title, chart_type, labels, values }),
+    }),
+  deleteChart: (id: string) =>
+    jsonFetch<{ deleted: string }>(`/api/charts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  memoryStats: () =>
+    jsonFetch<{ graph_dir: string; files_count: number; files: string[] }>('/api/memory/stats'),
+  uploadMemoryFile: async (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch('/api/memory/upload', { method: 'POST', body: form })
+    if (!res.ok) throw new Error(await res.text())
+    return (await res.json()) as { status: string; filename: string }
+  },
 }
 
 export async function streamChat(

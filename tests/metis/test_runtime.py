@@ -104,7 +104,9 @@ def test_fastapi_endpoints_and_sse(tmp_path: Path) -> None:
     assert skill_detail.status_code == 200
     assert "psutil" in skill_detail.json()["content"]
 
-    assert client.get("/api/cron").json() == {"enabled": False, "jobs": []}
+    cron_json = client.get("/api/cron").json()
+    assert cron_json["enabled"] is False
+    assert cron_json["jobs"] == []
 
     guard = app.state.workspace
     guard.write_file("hello.txt", "line1\nline2\n")

@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/components/NodeSwitcher.tsx"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/components/NodeSwitcher.tsx","./src/components/RadialGauge.tsx"],"version":"5.9.3"}

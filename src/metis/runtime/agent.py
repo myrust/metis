@@ -12,6 +12,7 @@ from metis.providers.router import ProviderRouter
 from metis.runtime.approval import ApprovalGate, LoopCircuitBreaker
 from metis.runtime.events import RuntimeEvent
 from metis.runtime.nodes import NodeRouter
+from metis.runtime.usage import UsageTracker
 from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
 from metis.skills_engine.loader import SkillRegistry
 
@@ -42,6 +43,7 @@ class MetisAgentRunner:
         approval_gate: ApprovalGate,
         skills: SkillRegistry | None = None,
         node_router: NodeRouter | None = None,
+        usage_tracker: UsageTracker | None = None,
         max_steps: int = 10,
         approval_timeout: float = 300.0,
     ) -> None:
@@ -53,6 +55,7 @@ class MetisAgentRunner:
             local_workspace=workspace.root,
             config_file=workspace.root.parent / "config.json",
         )
+        self.usage_tracker = usage_tracker
         self.max_steps = max_steps
         self.approval_timeout = approval_timeout
 
@@ -190,6 +193,14 @@ class MetisAgentRunner:
                     return
 
             reply = "".join(step_chunks)
+            if self.usage_tracker is not None:
+                self.usage_tracker.record_completion(
+                    provider_name=provider_id or (task_type or "router"),
+                    model=model,
+                    prompt_text=req.prompt,
+                    output_text=reply,
+                    ok=True,
+                )
             parsed = self._parse_tool_call(reply)
             if parsed is None:
                 yield RuntimeEvent("done", {"content": reply})

@@ -53,6 +53,24 @@ class CronHeartbeatService:
     def list_jobs(self) -> list[str]:
         return list(self._jobs.keys())
 
+    def jobs_detail(self) -> list[dict[str, object]]:
+        return [
+            {
+                "name": job.name,
+                "cron_expr": job.cron_expr,
+                "enabled": job.enabled,
+                "next_run": job.next_run.isoformat(),
+            }
+            for job in self._jobs.values()
+        ]
+
+    async def trigger_now(self, name: str) -> None:
+        job = self._jobs.get(name)
+        if job is None:
+            raise KeyError(f"Unknown cron job: {name}")
+        await job.callback(job.name)
+        job.advance(datetime.now(UTC))
+
     async def tick(self, now: datetime | None = None) -> list[str]:
         """Execute all due jobs once; returns names of jobs triggered."""
         if not self.enabled:
