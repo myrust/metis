@@ -110,6 +110,25 @@ class CronCreateRequest(BaseModel):
     prompt: str = ""
 
 
+class SessionCreateRequest(BaseModel):
+    title: str = "New Chat"
+    project_id: str | None = None
+
+
+class SessionMessageRequest(BaseModel):
+    id: str
+    kind: str
+    text: str
+    meta: dict[str, Any] | None = None
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    path: str
+    node_id: str = "local"
+    description: str = ""
+
+
 def build_default_router(config: MetisConfig) -> ProviderRouter:
     """Construct the Hephaestus ProviderRouter from MetisConfig."""
     return ProviderRouter(
@@ -441,6 +460,68 @@ def create_app(
         dest.write_bytes(await file.read())
         await mnemosyne.ingest_document(dest)
         return {"status": "ingested", "filename": safe_name, "path": str(dest)}
+
+    @app.get("/api/sessions")
+    async def list_sessions() -> dict[str, Any]:
+        return {"sessions": store.list_sessions()}
+
+    @app.post("/api/sessions")
+    async def create_session(body: SessionCreateRequest) -> dict[str, Any]:
+        return store.create_session(title=body.title, project_id=body.project_id)
+
+    @app.get("/api/sessions/{session_id}")
+    async def get_session(session_id: str) -> dict[str, Any]:
+        try:
+            return store.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/messages")
+    async def append_session_message(
+        session_id: str,
+        body: SessionMessageRequest,
+    ) -> dict[str, Any]:
+        try:
+            return store.append_session_message(session_id, body.model_dump())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_session(session_id: str) -> dict[str, str]:
+        try:
+            store.delete_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": session_id}
+
+    @app.get("/api/projects")
+    async def list_projects() -> dict[str, Any]:
+        return {"projects": store.list_projects()}
+
+    @app.post("/api/projects")
+    async def create_project(body: ProjectCreateRequest) -> dict[str, Any]:
+        proj = store.add_project(
+            name=body.name,
+            path=body.path,
+            node_id=body.node_id,
+            description=body.description,
+        )
+        try:
+            node = node_router.get_node(body.node_id)
+            if body.path not in node.allowed_paths:
+                node.allowed_paths.append(body.path)
+                node_router.add_node(node)
+        except KeyError:
+            pass
+        return proj
+
+    @app.delete("/api/projects/{project_id}")
+    async def delete_project(project_id: str) -> dict[str, str]:
+        try:
+            store.delete_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"deleted": project_id}
 
     @app.get("/api/nodes")
     async def list_nodes() -> dict[str, Any]:

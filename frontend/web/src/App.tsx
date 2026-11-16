@@ -9,6 +9,7 @@ import {
   Clock,
   DollarSign,
   FileCode2,
+  FolderGit2,
   Home,
   Lightbulb,
   ListTodo,
@@ -18,8 +19,10 @@ import {
   Plus,
   Send,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Sun,
+  Terminal,
   Trash2,
   Upload,
   XCircle,
@@ -33,6 +36,9 @@ import {
   type IdeaItem,
   type ModelsPayload,
   type NodeItem,
+  type PendingApprovalItem,
+  type ProjectItem,
+  type SessionItem,
   type SkillItem,
   type SystemMetrics,
   type TodoItem,
@@ -43,7 +49,7 @@ import { CustomChartSvg, RadialGauge } from './components/RadialGauge'
 
 type NavTab = 'workbench' | 'library' | 'ideas' | 'skills'
 type ChatSubTab = 'chat' | 'approvals' | 'cron'
-type RightBottomTab = 'todos' | 'workspace'
+type RightBottomTab = 'todos' | 'projects' | 'workspace'
 
 interface TimelineEntry {
   id: string
@@ -96,6 +102,15 @@ export default function App() {
   const [cronExpr, setCronExpr] = useState('0 * * * *')
   const [cronPrompt, setCronPrompt] = useState('')
 
+  const [sessions, setSessions] = useState<SessionItem[]>([])
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const [projects, setProjects] = useState<ProjectItem[]>([])
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
+  const [projName, setProjName] = useState('')
+  const [projPath, setProjPath] = useState('')
+  const [projNodeId, setProjNodeId] = useState('local')
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApprovalItem[]>([])
+
   const [prompt, setPrompt] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [timeline, setTimeline] = useState<TimelineEntry[]>([
@@ -115,21 +130,25 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     try {
-      const [h, n, s, f, c, m, d, sys, u, td, idList, chList, ms] = await Promise.all([
-        api.health(),
-        api.nodes(),
-        api.skills(),
-        api.workspaceFiles(),
-        api.cron(),
-        api.models(),
-        api.discoverModels(),
-        api.systemMetrics(),
-        api.usageSummary(7),
-        api.todos(),
-        api.ideas(),
-        api.charts(),
-        api.memoryStats(),
-      ])
+      const [h, n, s, f, c, m, d, sys, u, td, idList, chList, ms, sessRes, projRes, apRes] =
+        await Promise.all([
+          api.health(),
+          api.nodes(),
+          api.skills(),
+          api.workspaceFiles(),
+          api.cron(),
+          api.models(),
+          api.discoverModels(),
+          api.systemMetrics(),
+          api.usageSummary(7),
+          api.todos(),
+          api.ideas(),
+          api.charts(),
+          api.memoryStats(),
+          api.sessions(),
+          api.projects(),
+          api.pendingApprovals(),
+        ])
       setHealth(h)
       setNodes(n.nodes)
       setActiveNodeId(n.active_node_id)
@@ -144,6 +163,9 @@ export default function App() {
       setIdeas(idList.ideas)
       setCharts(chList.charts)
       setMemStats(ms)
+      setSessions(sessRes.sessions)
+      setProjects(projRes.projects)
+      setPendingApprovals(apRes.pending)
     } catch {
       // Backend might not be running during standalone preview.
     }
@@ -157,16 +179,64 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [refreshAll])
 
+  const handleNewChat = async () => {
+    const created = await api.createSession('新对话', activeProjectId)
+    setActiveSessionId(created.id)
+    setTimeline([
+      {
+        id: 'welcome',
+        kind: 'assistant',
+        text: "New session ready. OpenHands guardrails (Sandbox + 3-Strike Breaker + Approval) are active.",
+      },
+    ])
+    await refreshAll()
+  }
+
+  const handleSelectSession = (sessionId: string) => {
+    setActiveSessionId(sessionId)
+    const found = sessions.find((s) => s.id === sessionId)
+    if (found && found.messages.length > 0) {
+      setTimeline(found.messages)
+    } else {
+      setTimeline([
+        {
+          id: 'welcome',
+          kind: 'assistant',
+          text: "Session loaded. Ready when you are.",
+        },
+      ])
+    }
+  }
+
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!prompt.trim() || streaming) return
     const text = prompt.trim()
     setPrompt('')
     setStreaming(true)
-    setTimeline((prev) => [...prev, { id: `u-${Date.now()}`, kind: 'user', text }])
+
+    let sid = activeSessionId
+    if (!sid) {
+      try {
+        const created = await api.createSession(text.slice(0, 28), activeProjectId)
+        sid = created.id
+        setActiveSessionId(sid)
+      } catch {
+        sid = null
+      }
+    }
+
+    const userEntry: TimelineEntry = { id: `u-${Date.now()}`, kind: 'user', text }
+    setTimeline((prev) => [...prev, userEntry])
+    if (sid) void api.appendSessionMessage(sid, userEntry).catch(() => {})
 
     const [pinnedProvider, pinnedModel] =
       selectedModelKey === 'auto' ? [undefined, undefined] : selectedModelKey.split('::')
+
+    const activeProj = projects.find((p) => p.id === activeProjectId)
+    const projectSystemPrompt = activeProj
+      ? `Active Project: ${activeProj.name} (node_id=${activeProj.node_id}, path=${activeProj.path}). Prefer operating inside this project.`
+      : undefined
 
     let assistantBuffer = ''
     try {
@@ -183,24 +253,23 @@ export default function App() {
               ])
             }
           } else if (ev.event === 'tool_call') {
-            setTimeline((prev) => [
-              ...prev,
-              {
-                id: `tc-${Date.now()}-${Math.random()}`,
-                kind: 'tool_call',
-                text: `${ev.data.name}(${JSON.stringify(ev.data.args ?? {})})`,
-              },
-            ])
+            const entry: TimelineEntry = {
+              id: `tc-${Date.now()}-${Math.random()}`,
+              kind: 'tool_call',
+              text: `${ev.data.name}(${JSON.stringify(ev.data.args ?? {})})`,
+              meta: ev.data,
+            }
+            setTimeline((prev) => [...prev, entry])
+            if (sid) void api.appendSessionMessage(sid, entry).catch(() => {})
           } else if (ev.event === 'tool_result') {
-            setTimeline((prev) => [
-              ...prev,
-              {
-                id: `tr-${Date.now()}-${Math.random()}`,
-                kind: 'tool_result',
-                text: String(ev.data.output ?? ''),
-                meta: ev.data,
-              },
-            ])
+            const entry: TimelineEntry = {
+              id: `tr-${Date.now()}-${Math.random()}`,
+              kind: 'tool_result',
+              text: String(ev.data.output ?? ''),
+              meta: ev.data,
+            }
+            setTimeline((prev) => [...prev, entry])
+            if (sid) void api.appendSessionMessage(sid, entry).catch(() => {})
           } else if (ev.event === 'approval_required') {
             setTimeline((prev) => [
               ...prev,
@@ -217,13 +286,12 @@ export default function App() {
               typeof ev.data.error === 'string'
                 ? `Error: ${ev.data.error}`
                 : String(ev.data.content || assistantBuffer || 'Done.')
-            setTimeline((prev) => [
-              ...prev,
-              { id: `a-${Date.now()}`, kind: 'assistant', text: finalContent },
-            ])
+            const entry: TimelineEntry = { id: `a-${Date.now()}`, kind: 'assistant', text: finalContent }
+            setTimeline((prev) => [...prev, entry])
+            if (sid) void api.appendSessionMessage(sid, entry).catch(() => {})
           }
         },
-        { provider_id: pinnedProvider, model: pinnedModel },
+        { provider_id: pinnedProvider, model: pinnedModel, system_prompt: projectSystemPrompt },
       )
     } catch (err) {
       setTimeline((prev) => [
@@ -421,11 +489,53 @@ export default function App() {
             <div className="grid flex-1 grid-cols-1 gap-6 lg:grid-cols-12">
               {/* Left Chat + Cron + Approvals Card */}
               <section className={`${cardClass} flex h-[660px] flex-col p-5 lg:col-span-5`}>
-                <div className="mb-4 flex items-center justify-between">
+                {/* Session Switcher + New Chat */}
+                <div className="mb-2.5 flex items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleNewChat()}
+                      className="flex shrink-0 items-center gap-1 rounded-full bg-zinc-900 px-3 py-1 text-[11px] font-medium text-white dark:bg-white dark:text-zinc-900"
+                    >
+                      <Plus className="h-3 w-3" /> 新对话
+                    </button>
+                    <select
+                      value={activeSessionId ?? ''}
+                      onChange={(e) => handleSelectSession(e.target.value)}
+                      className="min-w-0 flex-1 truncate rounded-full bg-zinc-500/10 px-2.5 py-1 text-[11px] outline-none"
+                    >
+                      <option value="">当前临时会话</option>
+                      {sessions.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.title}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {activeProjectId && (
+                    <span className="shrink-0 rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
+                      {projects.find((p) => p.id === activeProjectId)?.name ?? 'Project'}
+                    </span>
+                  )}
+                </div>
+
+                {/* OpenHands Guardrails Strip */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-zinc-500/8 px-3 py-1.5 text-[10px]">
+                  <span className="flex items-center gap-1 font-medium text-emerald-700 dark:text-emerald-300">
+                    <ShieldCheck className="h-3 w-3" /> OpenHands 护栏: 隔离 + 3次熔断
+                  </span>
+                  <span className="opacity-70">节点: {activeNodeId}</span>
+                </div>
+
+                <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     {[
                       { id: 'chat' as const, icon: MessageSquare, label: 'Chat' },
-                      { id: 'approvals' as const, icon: ShieldAlert, label: 'Approvals' },
+                      {
+                        id: 'approvals' as const,
+                        icon: ShieldAlert,
+                        label: `审批 (${pendingApprovals.length})`,
+                      },
                       { id: 'cron' as const, icon: Clock, label: '定时任务' },
                     ].map((st) => {
                       const Icon = st.icon
@@ -447,9 +557,6 @@ export default function App() {
                       )
                     })}
                   </div>
-                  <span className="rounded-full bg-emerald-400/20 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-                    {activeNodeId}
-                  </span>
                 </div>
 
                 {chatTab === 'chat' && (
@@ -492,13 +599,23 @@ export default function App() {
                         }
 
                         if (item.kind === 'tool_call' || item.kind === 'tool_result') {
+                          const ok = item.meta?.ok !== false
                           return (
                             <div
                               key={item.id}
-                              className="rounded-2xl bg-zinc-500/10 px-3 py-2 font-mono text-[11px]"
+                              className={`rounded-2xl border px-3 py-2 font-mono text-[11px] ${
+                                item.kind === 'tool_call'
+                                  ? 'border-sky-400/30 bg-sky-500/8'
+                                  : ok
+                                    ? 'border-emerald-400/30 bg-emerald-500/8'
+                                    : 'border-rose-400/30 bg-rose-500/8'
+                              }`}
                             >
-                              <span className="font-semibold uppercase opacity-60">{item.kind}: </span>
-                              <span className="break-all">{item.text}</span>
+                              <div className="mb-0.5 flex items-center gap-1.5 font-semibold uppercase opacity-75">
+                                <Terminal className="h-3 w-3" />
+                                <span>{item.kind}</span>
+                              </div>
+                              <div className="break-all">{item.text}</div>
                             </div>
                           )
                         }
@@ -560,9 +677,53 @@ export default function App() {
                 )}
 
                 {chatTab === 'approvals' && (
-                  <div className={`flex-1 rounded-3xl border p-4 text-sm ${innerSurface}`}>
-                    当前挂起审批数：{health?.pending_approvals ?? 0}。当 Agent 触发文件写入、敏感
-                    Shell 或 `git push` 时，审批卡片会直接出现在 Chat 流中。
+                  <div className={`flex-1 space-y-3 overflow-y-auto rounded-3xl border p-4 text-xs ${innerSurface}`}>
+                    <div className="flex items-center justify-between font-semibold">
+                      <span>OpenHands 挂起审批队列</span>
+                      <span>{pendingApprovals.length} 项待处理</span>
+                    </div>
+                    {pendingApprovals.length === 0 ? (
+                      <div className="opacity-65">
+                        当前无挂起审批。敏感 Shell（含 `git push` / `rm -rf`）、文件写入及 3
+                        次重复错误熔断会自动进入此队列。
+                      </div>
+                    ) : (
+                      pendingApprovals.map((ap) => (
+                        <div
+                          key={ap.approval_id}
+                          className="rounded-2xl border border-amber-400/40 bg-amber-50/80 p-3 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100"
+                        >
+                          <div className="font-semibold">
+                            [{ap.action_type}] {ap.summary}
+                          </div>
+                          <pre className="mt-1 overflow-x-auto text-[11px] opacity-80">
+                            {JSON.stringify(ap.details, null, 2)}
+                          </pre>
+                          <div className="mt-2 flex gap-2">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await api.approve(ap.approval_id, true)
+                                await refreshAll()
+                              }}
+                              className="rounded-full bg-emerald-600 px-3 py-1 text-white"
+                            >
+                              批准执行
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await api.approve(ap.approval_id, false)
+                                await refreshAll()
+                              }}
+                              className="rounded-full bg-rose-600 px-3 py-1 text-white"
+                            >
+                              拒绝
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
                   </div>
                 )}
 
@@ -718,10 +879,10 @@ export default function App() {
                   </div>
                 </section>
 
-                {/* Bottom-Right: To-do List & Workspace Explorer */}
+                {/* Bottom-Right: To-do List, Projects & Workspace Explorer */}
                 <section className={`${cardClass} flex flex-1 flex-col p-5`}>
                   <div className="mb-3 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={() => setRightBottomTab('todos')}
@@ -731,7 +892,18 @@ export default function App() {
                             : 'bg-zinc-500/10'
                         }`}
                       >
-                        <ListTodo className="h-3.5 w-3.5" /> To-do List ({todos.length})
+                        <ListTodo className="h-3.5 w-3.5" /> To-do ({todos.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRightBottomTab('projects')}
+                        className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${
+                          rightBottomTab === 'projects'
+                            ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900'
+                            : 'bg-zinc-500/10'
+                        }`}
+                      >
+                        <FolderGit2 className="h-3.5 w-3.5" /> 项目管理 ({projects.length})
                       </button>
                       <button
                         type="button"
@@ -747,7 +919,104 @@ export default function App() {
                     </div>
                   </div>
 
-                  {rightBottomTab === 'todos' ? (
+                  {rightBottomTab === 'projects' ? (
+                    <div className="flex flex-1 flex-col gap-3">
+                      <form
+                        onSubmit={async (e) => {
+                          e.preventDefault()
+                          if (!projName.trim() || !projPath.trim()) return
+                          await api.addProject(projName.trim(), projPath.trim(), projNodeId)
+                          setProjName('')
+                          setProjPath('')
+                          await refreshAll()
+                        }}
+                        className="flex flex-wrap gap-2"
+                      >
+                        <input
+                          value={projName}
+                          onChange={(e) => setProjName(e.target.value)}
+                          placeholder="项目名"
+                          className={`w-28 rounded-full border px-3 py-1.5 text-xs outline-none ${innerSurface}`}
+                        />
+                        <input
+                          value={projPath}
+                          onChange={(e) => setProjPath(e.target.value)}
+                          placeholder="项目路径 (自动加入节点 allowed_paths)"
+                          className={`flex-1 rounded-full border px-3 py-1.5 text-xs outline-none ${innerSurface}`}
+                        />
+                        <select
+                          value={projNodeId}
+                          onChange={(e) => setProjNodeId(e.target.value)}
+                          className={`rounded-full border px-2.5 py-1.5 text-xs outline-none ${innerSurface}`}
+                        >
+                          {nodes.map((n) => (
+                            <option key={n.id} value={n.id}>
+                              {n.id}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="submit"
+                          className="rounded-full bg-zinc-900 px-3.5 py-1.5 text-xs font-medium text-white dark:bg-white dark:text-zinc-900"
+                        >
+                          添加项目
+                        </button>
+                      </form>
+                      <div className={`max-h-[220px] flex-1 space-y-2 overflow-y-auto rounded-2xl border p-3 ${innerSurface}`}>
+                        {projects.length === 0 ? (
+                          <div className="text-xs opacity-60">暂无绑定项目</div>
+                        ) : (
+                          projects.map((proj) => {
+                            const bound = activeProjectId === proj.id
+                            return (
+                              <div
+                                key={proj.id}
+                                className="flex items-center justify-between rounded-xl border border-zinc-400/20 px-3 py-2 text-xs"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="font-semibold">
+                                    {proj.name}{' '}
+                                    <span className="font-mono text-[10px] opacity-60">
+                                      ({proj.node_id})
+                                    </span>
+                                  </div>
+                                  <div className="truncate font-mono text-[10px] opacity-65">
+                                    {proj.path}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setActiveProjectId(bound ? null : proj.id)
+                                    }
+                                    className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                                      bound
+                                        ? 'bg-emerald-500 text-white'
+                                        : 'bg-zinc-500/15 hover:bg-zinc-500/25'
+                                    }`}
+                                  >
+                                    {bound ? '已绑定对话' : '绑定对话'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      await api.deleteProject(proj.id)
+                                      if (bound) setActiveProjectId(null)
+                                      await refreshAll()
+                                    }}
+                                    className="text-rose-500 opacity-60 hover:opacity-100"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                    </div>
+                  ) : rightBottomTab === 'todos' ? (
                     <div className="flex flex-1 flex-col gap-3">
                       <form
                         onSubmit={async (e) => {

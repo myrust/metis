@@ -118,6 +118,37 @@ export interface CronDetail {
   next_run: string
 }
 
+export interface SessionMessage {
+  id: string
+  kind: 'user' | 'thinking' | 'tool_call' | 'tool_result' | 'approval' | 'assistant'
+  text: string
+  meta?: Record<string, unknown>
+}
+
+export interface SessionItem {
+  id: string
+  title: string
+  project_id?: string | null
+  created_at: number
+  messages: SessionMessage[]
+}
+
+export interface ProjectItem {
+  id: string
+  name: string
+  path: string
+  node_id: string
+  description: string
+  created_at: number
+}
+
+export interface PendingApprovalItem {
+  approval_id: string
+  action_type: string
+  summary: string
+  details: Record<string, unknown>
+}
+
 export interface SseEvent {
   event: 'thinking' | 'tool_call' | 'tool_result' | 'approval_required' | 'done'
   data: Record<string, unknown>
@@ -234,12 +265,38 @@ export const api = {
     if (!res.ok) throw new Error(await res.text())
     return (await res.json()) as { status: string; filename: string }
   },
+  pendingApprovals: () => jsonFetch<{ pending: PendingApprovalItem[] }>('/api/approval'),
+  sessions: () => jsonFetch<{ sessions: SessionItem[] }>('/api/sessions'),
+  createSession: (title = '新对话', project_id?: string | null) =>
+    jsonFetch<SessionItem>('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ title, project_id: project_id ?? null }),
+    }),
+  appendSessionMessage: (sessionId: string, entry: SessionMessage) =>
+    jsonFetch<SessionItem>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      method: 'POST',
+      body: JSON.stringify(entry),
+    }),
+  deleteSession: (sessionId: string) =>
+    jsonFetch<{ deleted: string }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+    }),
+  projects: () => jsonFetch<{ projects: ProjectItem[] }>('/api/projects'),
+  addProject: (name: string, path: string, node_id = 'local', description = '') =>
+    jsonFetch<ProjectItem>('/api/projects', {
+      method: 'POST',
+      body: JSON.stringify({ name, path, node_id, description }),
+    }),
+  deleteProject: (projectId: string) =>
+    jsonFetch<{ deleted: string }>(`/api/projects/${encodeURIComponent(projectId)}`, {
+      method: 'DELETE',
+    }),
 }
 
 export async function streamChat(
   prompt: string,
   onEvent: (ev: SseEvent) => void,
-  options?: { model?: string; provider_id?: string },
+  options?: { model?: string; provider_id?: string; system_prompt?: string },
 ): Promise<void> {
   const res = await fetch('/api/chat/stream', {
     method: 'POST',
@@ -248,6 +305,7 @@ export async function streamChat(
       prompt,
       model: options?.model || null,
       provider_id: options?.provider_id || null,
+      system_prompt: options?.system_prompt || null,
     }),
   })
   if (!res.ok || !res.body) {

@@ -94,3 +94,24 @@ def test_workbench_endpoints(tmp_path: Path) -> None:
 
     assert client.get("/api/memory/stats").status_code == 200
     assert client.get("/api/usage/summary").status_code == 200
+
+    sess = client.post("/api/sessions", json={"title": "Session 1"}).json()
+    assert len(client.get("/api/sessions").json()["sessions"]) == 1
+    msg_res = client.post(
+        f"/api/sessions/{sess['id']}/messages",
+        json={"id": "m1", "kind": "user", "text": "Hello session"},
+    )
+    assert msg_res.status_code == 200
+    assert len(msg_res.json()["messages"]) == 1
+    assert client.delete(f"/api/sessions/{sess['id']}").status_code == 200
+
+    proj_dir = str((tmp_path / "my-proj").resolve())
+    proj = client.post(
+        "/api/projects",
+        json={"name": "my-proj", "path": proj_dir, "node_id": "local"},
+    ).json()
+    assert len(client.get("/api/projects").json()["projects"]) == 1
+    nodes_after = client.get("/api/nodes").json()["nodes"]
+    local_node = next(n for n in nodes_after if n["id"] == "local")
+    assert proj_dir in local_node["allowed_paths"]
+    assert client.delete(f"/api/projects/{proj['id']}").status_code == 200
