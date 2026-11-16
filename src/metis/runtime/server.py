@@ -3,26 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from metis.automation.cron import CronHeartbeatService
 from metis.config import MetisConfig
+from metis.memory.mnemosyne import MnemosyneMemory
 from metis.providers.api_adapter import (
     AnthropicApiProvider,
     GeminiApiProvider,
     OpenAICompatProvider,
 )
-from metis.providers.base import ProviderRequest
 from metis.providers.codex_cli import CodexCliProvider
 from metis.providers.router import ProviderRouter
+from metis.runtime.agent import MetisAgentRunner
 from metis.runtime.approval import ApprovalGate
-from metis.runtime.events import RuntimeEvent
-from metis.runtime.workspace import WorkspaceGuard
+from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
+from metis.skills_engine.distiller import SkillDistiller
+from metis.skills_engine.loader import SkillRegistry
 
 
 class ChatRequest(BaseModel):
@@ -37,6 +42,22 @@ class ApprovalDecision(BaseModel):
     approved: bool
 
 
+class DistillSkillRequest(BaseModel):
+    skill_name: str
+    description: str
+    transcript: list[str]
+
+
+class MemoryIngestRequest(BaseModel):
+    text: str | None = None
+    file_path: str | None = None
+
+
+class MemoryQueryRequest(BaseModel):
+    question: str
+    mode: str = "hybrid"
+
+
 def build_default_router(config: MetisConfig) -> ProviderRouter:
     """Construct the Hephaestus ProviderRouter from MetisConfig."""
     return ProviderRouter(
@@ -49,23 +70,56 @@ def build_default_router(config: MetisConfig) -> ProviderRouter:
     )
 
 
+def _default_skill_dirs(config: MetisConfig) -> list[Path]:
+    dirs: list[Path] = []
+    repo_skills = Path(__file__).resolve().parents[3] / "skills"
+    if repo_skills.is_dir():
+        dirs.append(repo_skills)
+    dirs.append(config.skills_dir)
+    return dirs
+
+
 def create_app(
     config: MetisConfig | None = None,
     router: ProviderRouter | None = None,
+    memory: MnemosyneMemory | None = None,
 ) -> FastAPI:
     """Create and configure the Metis FastAPI application."""
     cfg = config or MetisConfig.load()
     cfg.ensure_directories()
 
-    app = FastAPI(title="Metis Backend", version="0.1.0")
     gate = ApprovalGate()
     workspace = WorkspaceGuard(cfg.workspace_dir)
     active_router = router or build_default_router(cfg)
+    skills = SkillRegistry(_default_skill_dirs(cfg))
+    distiller = SkillDistiller(cfg.skills_dir, provider=None)
+    mnemosyne = memory or MnemosyneMemory(graph_dir=cfg.graph_dir, llm_backend=active_router)
+    cron = CronHeartbeatService(enabled=cfg.cron_enabled)
+    runner = MetisAgentRunner(
+        router=active_router,
+        workspace=workspace,
+        approval_gate=gate,
+        skills=skills,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await cron.start()
+        try:
+            yield
+        finally:
+            await cron.stop()
+
+    app = FastAPI(title="Metis Backend", version="0.1.0", lifespan=lifespan)
 
     app.state.config = cfg
     app.state.approval_gate = gate
     app.state.workspace = workspace
     app.state.router = active_router
+    app.state.skills = skills
+    app.state.memory = mnemosyne
+    app.state.cron = cron
+    app.state.runner = runner
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -75,6 +129,9 @@ def create_app(
             "port": cfg.port,
             "workspace": str(cfg.workspace_dir),
             "pending_approvals": len(gate.list_pending()),
+            "skills_count": len(skills.list_summaries()),
+            "cron_enabled": cfg.cron_enabled,
+            "telegram_enabled": cfg.telegram_enabled,
         }
 
     @app.get("/api/approval")
@@ -91,30 +148,86 @@ def create_app(
     @app.post("/api/chat/stream")
     async def chat_stream(body: ChatRequest) -> EventSourceResponse:
         async def event_generator() -> AsyncIterator[dict[str, str]]:
-            req = ProviderRequest(
+            async for event in runner.run_stream(
                 prompt=body.prompt,
                 system_prompt=body.system_prompt,
                 model=body.model,
-            )
-            full_text: list[str] = []
-            async for ev in active_router.stream(req, task_type=body.task_type):
-                if ev.kind == "thinking":
-                    yield RuntimeEvent("thinking", {"content": ev.content}).to_sse_dict()
-                elif ev.kind == "text_delta":
-                    full_text.append(ev.content)
-                    yield RuntimeEvent("thinking", {"delta": ev.content}).to_sse_dict()
-                elif ev.kind == "error":
-                    yield RuntimeEvent("done", {"error": ev.content}).to_sse_dict()
-                    return
-                elif ev.kind == "done":
-                    yield RuntimeEvent(
-                        "done",
-                        {"content": "".join(full_text) or ev.content},
-                    ).to_sse_dict()
-                    return
-            yield RuntimeEvent("done", {"content": "".join(full_text)}).to_sse_dict()
+                task_type=body.task_type,
+            ):
+                yield event.to_sse_dict()
 
         return EventSourceResponse(event_generator())
+
+    @app.get("/api/skills")
+    async def list_skills() -> dict[str, Any]:
+        skills.refresh()
+        return {
+            "skills": [
+                {"name": s.name, "description": s.description, "path": str(s.path)}
+                for s in skills.list_summaries()
+            ]
+        }
+
+    @app.get("/api/skills/{name}")
+    async def get_skill(name: str) -> dict[str, str]:
+        try:
+            content = skills.load_skill(name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found") from exc
+        return {"name": name, "content": content}
+
+    @app.post("/api/skills/distill")
+    async def distill_skill(body: DistillSkillRequest) -> dict[str, str]:
+        path = await distiller.distill_from_messages(
+            skill_name=body.skill_name,
+            description=body.description,
+            transcript=body.transcript,
+        )
+        skills.refresh()
+        return {"path": str(path)}
+
+    @app.get("/api/workspace/files")
+    async def list_workspace_files() -> dict[str, Any]:
+        files = sorted(
+            str(p.relative_to(workspace.root))
+            for p in workspace.root.rglob("*")
+            if p.is_file()
+        )
+        return {"workspace": str(workspace.root), "files": files}
+
+    @app.get("/api/workspace/read")
+    async def read_workspace_file(
+        path: str = Query(...),
+        start_line: int = Query(1, ge=1),
+        end_line: int | None = Query(None, ge=1),
+    ) -> dict[str, str]:
+        try:
+            content = workspace.read_lines(path, start_line=start_line, end_line=end_line)
+        except WorkspaceViolationError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"File not found: {path}") from exc
+        return {"path": path, "content": content}
+
+    @app.post("/api/memory/ingest")
+    async def ingest_memory(body: MemoryIngestRequest) -> dict[str, str]:
+        if body.text:
+            await mnemosyne.ingest_text(body.text)
+            return {"status": "ingested", "kind": "text"}
+        if body.file_path:
+            target = workspace.resolve_path(body.file_path)
+            await mnemosyne.ingest_document(target)
+            return {"status": "ingested", "kind": "document", "path": str(target)}
+        raise HTTPException(status_code=400, detail="Either 'text' or 'file_path' is required")
+
+    @app.post("/api/memory/query")
+    async def query_memory(body: MemoryQueryRequest) -> dict[str, str]:
+        answer = await mnemosyne.query(body.question, mode=body.mode)
+        return {"question": body.question, "mode": body.mode, "answer": answer}
+
+    @app.get("/api/cron")
+    async def cron_status() -> dict[str, Any]:
+        return {"enabled": cron.enabled, "jobs": cron.list_jobs()}
 
     # Optional static frontend mount point (left empty in Phase 1).
     if cfg.static_dir and cfg.static_dir.is_dir():
