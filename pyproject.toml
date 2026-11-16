@@ -20,6 +20,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "sse-starlette>=2.1.0",
+    "asyncssh>=2.14.0",
     "psutil>=6.0.0",
     "lightrag-hku>=1.0.0",
     "raganything>=1.0.0",

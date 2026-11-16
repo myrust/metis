@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
@@ -12,6 +11,7 @@ from metis.providers.base import ProviderRequest
 from metis.providers.router import ProviderRouter
 from metis.runtime.approval import ApprovalGate, LoopCircuitBreaker
 from metis.runtime.events import RuntimeEvent
+from metis.runtime.nodes import NodeRouter
 from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
 from metis.skills_engine.loader import SkillRegistry
 
@@ -21,12 +21,12 @@ _SYSTEM_PREAMBLE = """You are Metis, a cross-platform personal AI workbench assi
 When you need to use a tool, emit a single block in this exact format:
 <tool_call>{"name": "<tool_name>", "args": {<json_args>}}</tool_call>
 
-Available tools:
-- list_files: {"subdir": "."}
-- read_file: {"path": "<rel_path>", "start_line": 1, "end_line": 200}
-- write_file: {"path": "<rel_path>", "content": "<text>"}
-- edit_diff: {"path": "<rel_path>", "target": "<exact_snippet>", "replacement": "<new_text>"}
-- run_shell: {"command": "<shell_cmd>"}
+Available tools (pass optional "node_id" to target a specific node, otherwise the [active] node is used):
+- list_files: {"subdir": ".", "node_id": "local"}
+- read_file: {"path": "<rel_path>", "start_line": 1, "end_line": 200, "node_id": "local"}
+- write_file: {"path": "<rel_path>", "content": "<text>", "node_id": "local"}
+- edit_diff: {"path": "<rel_path>", "target": "<exact_snippet>", "replacement": "<new_text>", "node_id": "local"}
+- run_shell: {"command": "<shell_cmd>", "node_id": "local"}
 - load_skill: {"name": "<skill_name>"}
 
 If no tool is needed, reply directly to the user."""
@@ -41,6 +41,7 @@ class MetisAgentRunner:
         workspace: WorkspaceGuard,
         approval_gate: ApprovalGate,
         skills: SkillRegistry | None = None,
+        node_router: NodeRouter | None = None,
         max_steps: int = 10,
         approval_timeout: float = 300.0,
     ) -> None:
@@ -48,11 +49,15 @@ class MetisAgentRunner:
         self.workspace = workspace
         self.approval_gate = approval_gate
         self.skills = skills
+        self.node_router = node_router or NodeRouter(
+            local_workspace=workspace.root,
+            nodes_file=workspace.root.parent / "nodes.yaml",
+        )
         self.max_steps = max_steps
         self.approval_timeout = approval_timeout
 
     def _build_system_prompt(self, extra_system: str | None) -> str:
-        parts = [_SYSTEM_PREAMBLE]
+        parts = [_SYSTEM_PREAMBLE, self.node_router.render_prompt_index()]
         if self.skills is not None:
             index = self.skills.render_prompt_index()
             if index:
@@ -84,39 +89,40 @@ class MetisAgentRunner:
         return event, req
 
     async def _execute_tool(self, name: str, args: dict[str, Any]) -> tuple[bool, str]:
-        """Execute a single workspace/skill/shell tool; returns (ok, output)."""
+        """Execute a single workspace/skill/shell tool via NodeRouter; returns (ok, output)."""
+        node_id = str(args["node_id"]) if args.get("node_id") else None
         try:
             if name == "list_files":
-                subdir = str(args.get("subdir", "."))
-                target = self.workspace.resolve_path(subdir)
-                if not target.is_dir():
-                    return False, f"Directory not found: {subdir}"
-                items = sorted(
-                    str(p.relative_to(self.workspace.root))
-                    for p in target.rglob("*")
-                    if p.is_file()
+                return await self.node_router.list_files(
+                    subdir=str(args.get("subdir", ".")),
+                    node_id=node_id,
                 )
-                return True, "\n".join(items) if items else "(empty)"
 
             if name == "read_file":
-                out = self.workspace.read_lines(
+                out = await self.node_router.read_lines(
                     path=str(args["path"]),
                     start_line=int(args.get("start_line", 1)),
                     end_line=int(args["end_line"]) if args.get("end_line") is not None else None,
+                    node_id=node_id,
                 )
                 return True, out
 
             if name == "write_file":
-                written = self.workspace.write_file(str(args["path"]), str(args["content"]))
-                return True, f"Wrote {written.relative_to(self.workspace.root)}"
+                msg = await self.node_router.write_file(
+                    path=str(args["path"]),
+                    content=str(args["content"]),
+                    node_id=node_id,
+                )
+                return True, msg
 
             if name == "edit_diff":
-                edited = self.workspace.apply_diff(
-                    str(args["path"]),
-                    str(args["target"]),
-                    str(args["replacement"]),
+                msg = await self.node_router.apply_diff(
+                    path=str(args["path"]),
+                    target_snippet=str(args["target"]),
+                    replacement=str(args["replacement"]),
+                    node_id=node_id,
                 )
-                return True, f"Updated {edited.relative_to(self.workspace.root)}"
+                return True, msg
 
             if name == "load_skill":
                 if self.skills is None:
@@ -124,19 +130,10 @@ class MetisAgentRunner:
                 return True, self.skills.load_skill(str(args["name"]))
 
             if name == "run_shell":
-                cmd = str(args["command"])
-                proc = await asyncio.create_subprocess_shell(
-                    cmd,
-                    cwd=str(self.workspace.root),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                return await self.node_router.run_shell(
+                    command=str(args["command"]),
+                    node_id=node_id,
                 )
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-                stdout = stdout_b.decode("utf-8", errors="replace").strip()
-                stderr = stderr_b.decode("utf-8", errors="replace").strip()
-                if proc.returncode != 0:
-                    return False, stderr or f"Command exited with {proc.returncode}"
-                return True, stdout or "(no output)"
 
             return False, f"Unknown tool: {name}"
         except (KeyError, ValueError, OSError, WorkspaceViolationError, TimeoutError) as exc:

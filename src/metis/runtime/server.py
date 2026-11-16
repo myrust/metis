@@ -25,6 +25,7 @@ from metis.providers.codex_cli import CodexCliProvider
 from metis.providers.router import ProviderRouter
 from metis.runtime.agent import MetisAgentRunner
 from metis.runtime.approval import ApprovalGate
+from metis.runtime.nodes import NodeConfig, NodeRouter
 from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
 from metis.skills_engine.distiller import SkillDistiller
 from metis.skills_engine.loader import SkillRegistry
@@ -56,6 +57,16 @@ class MemoryIngestRequest(BaseModel):
 class MemoryQueryRequest(BaseModel):
     question: str
     mode: str = "hybrid"
+
+
+class NodeUpsertRequest(BaseModel):
+    id: str
+    kind: str = "ssh"
+    host: str
+    workspace: str
+    user: str | None = None
+    port: int | None = None
+    description: str = ""
 
 
 def build_default_router(config: MetisConfig) -> ProviderRouter:
@@ -90,6 +101,10 @@ def create_app(
 
     gate = ApprovalGate()
     workspace = WorkspaceGuard(cfg.workspace_dir)
+    node_router = NodeRouter(
+        local_workspace=cfg.workspace_dir,
+        nodes_file=cfg.home_dir / "nodes.yaml",
+    )
     active_router = router or build_default_router(cfg)
     skills = SkillRegistry(_default_skill_dirs(cfg))
     distiller = SkillDistiller(cfg.skills_dir, provider=None)
@@ -100,6 +115,7 @@ def create_app(
         workspace=workspace,
         approval_gate=gate,
         skills=skills,
+        node_router=node_router,
     )
 
     @asynccontextmanager
@@ -109,12 +125,14 @@ def create_app(
             yield
         finally:
             await cron.stop()
+            await node_router.close_all()
 
     app = FastAPI(title="Metis Backend", version="0.1.0", lifespan=lifespan)
 
     app.state.config = cfg
     app.state.approval_gate = gate
     app.state.workspace = workspace
+    app.state.node_router = node_router
     app.state.router = active_router
     app.state.skills = skills
     app.state.memory = mnemosyne
@@ -228,6 +246,57 @@ def create_app(
     @app.get("/api/cron")
     async def cron_status() -> dict[str, Any]:
         return {"enabled": cron.enabled, "jobs": cron.list_jobs()}
+
+    @app.get("/api/nodes")
+    async def list_nodes() -> dict[str, Any]:
+        return {
+            "active_node_id": node_router.active_node_id,
+            "nodes": [
+                {
+                    "id": n.id,
+                    "kind": n.kind,
+                    "host": n.host,
+                    "workspace": n.workspace,
+                    "user": n.user,
+                    "port": n.port,
+                    "description": n.description,
+                }
+                for n in node_router.list_nodes()
+            ],
+        }
+
+    @app.post("/api/nodes")
+    async def upsert_node(body: NodeUpsertRequest) -> dict[str, Any]:
+        node = node_router.add_node(
+            NodeConfig(
+                id=body.id,
+                kind=body.kind,
+                host=body.host,
+                workspace=body.workspace,
+                user=body.user,
+                port=body.port,
+                description=body.description,
+            )
+        )
+        return {"id": node.id, "kind": node.kind, "host": node.host, "workspace": node.workspace}
+
+    @app.delete("/api/nodes/{node_id}")
+    async def delete_node(node_id: str) -> dict[str, str]:
+        try:
+            await node_router.remove_node(node_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown node_id: {node_id}") from exc
+        return {"deleted": node_id, "active_node_id": node_router.active_node_id}
+
+    @app.post("/api/nodes/{node_id}/activate")
+    async def activate_node(node_id: str) -> dict[str, str]:
+        try:
+            node = node_router.activate(node_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown node_id: {node_id}") from exc
+        return {"active_node_id": node.id}
 
     # Optional static frontend mount point (left empty in Phase 1).
     if cfg.static_dir and cfg.static_dir.is_dir():
