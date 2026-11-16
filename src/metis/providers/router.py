@@ -22,8 +22,17 @@ class ProviderRouter:
         self._order = [p.name for p in providers]
         self._task_routes = task_routes or {}
 
-    def candidates_for(self, task_type: str | None = None) -> list[BaseModelProvider]:
-        """Return ordered available providers for a given task_type."""
+    def candidates_for(
+        self,
+        task_type: str | None = None,
+        provider_id: str | None = None,
+    ) -> list[BaseModelProvider]:
+        """Return ordered available providers for a given task_type or pinned provider_id."""
+        if provider_id and provider_id in self._providers:
+            pinned = self._providers[provider_id]
+            if pinned.is_available():
+                return [pinned]
+
         names = self._task_routes.get(task_type, self._order) if task_type else self._order
         ordered: list[BaseModelProvider] = []
         for name in names:
@@ -40,9 +49,10 @@ class ProviderRouter:
         self,
         request: ProviderRequest,
         task_type: str | None = None,
+        provider_id: str | None = None,
     ) -> AsyncIterator[ProviderStreamEvent]:
         """Stream from the first available provider, falling back on errors before output."""
-        candidates = self.candidates_for(task_type)
+        candidates = self.candidates_for(task_type=task_type, provider_id=provider_id)
         if not candidates:
             yield ProviderStreamEvent(
                 kind="error",

@@ -95,6 +95,10 @@ export const api = {
       `/api/workspace/read?path=${encodeURIComponent(path)}&start_line=${start_line}&end_line=${end_line}`,
     ),
   models: () => jsonFetch<ModelsPayload>('/api/models'),
+  discoverModels: () =>
+    jsonFetch<{ models: Array<{ provider_id: string; model: string }>; error: string | null }>(
+      '/api/models/discover',
+    ),
   updateModels: (payload: Partial<ModelsPayload>) =>
     jsonFetch<ModelsPayload>('/api/models', { method: 'POST', body: JSON.stringify(payload) }),
   queryMemory: (question: string, mode = 'hybrid') =>
@@ -114,11 +118,16 @@ export const api = {
 export async function streamChat(
   prompt: string,
   onEvent: (ev: SseEvent) => void,
+  options?: { model?: string; provider_id?: string },
 ): Promise<void> {
   const res = await fetch('/api/chat/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({
+      prompt,
+      model: options?.model || null,
+      provider_id: options?.provider_id || null,
+    }),
   })
   if (!res.ok || !res.body) {
     throw new Error(`Stream failed: HTTP ${res.status}`)

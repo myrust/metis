@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from metis.config import MemoryRoleConfig, MnemosyneConfig
+from metis.providers.api_adapter import (
+    AnthropicApiProvider,
+    GeminiApiProvider,
+    OpenAICompatProvider,
+)
+from metis.providers.base import BaseModelProvider
+from metis.providers.codex_cli import CodexCliProvider
+from metis.providers.router import ProviderRouter
 
 
 @dataclass
@@ -192,3 +203,74 @@ class ModelsRegistry:
             vision=_merge("memory_vision", base_cfg.vision),
             embedding_dim=base_cfg.embedding_dim,
         )
+
+    def build_provider_router(
+        self,
+        codex_bin: str | None = None,
+        workspace_dir: Path | None = None,
+    ) -> ProviderRouter:
+        """Build a live ProviderRouter from providers + roles in models.json."""
+        built: list[BaseModelProvider] = []
+        for entry in self.providers.values():
+            if not entry.enabled:
+                continue
+            provider: BaseModelProvider | None = None
+            if entry.type == "gemini":
+                provider = GeminiApiProvider(
+                    api_key=entry.api_key,
+                    base_url=entry.base_url,
+                    default_model=entry.default_model or "gemini-2.5-flash",
+                )
+            elif entry.type == "openai_compat":
+                provider = OpenAICompatProvider(
+                    api_key=entry.api_key,
+                    base_url=entry.base_url,
+                    default_model=entry.default_model or "gpt-4o-mini",
+                )
+            elif entry.type == "anthropic":
+                provider = AnthropicApiProvider(
+                    api_key=entry.api_key,
+                    base_url=entry.base_url,
+                    default_model=entry.default_model or "claude-sonnet-4-5",
+                )
+            elif entry.type == "codex":
+                provider = CodexCliProvider(
+                    binary_path=codex_bin,
+                    workspace_dir=workspace_dir,
+                )
+            if provider is not None:
+                provider.name = entry.id
+                built.append(provider)
+
+        task_routes: dict[str, list[str]] = {}
+        for role_name, route in self.roles.items():
+            task_routes[role_name] = [route.provider_id, *route.fallback_providers]
+
+        return ProviderRouter(providers=built, task_routes=task_routes)
+
+
+async def discover_gemini_models(
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> list[str]:
+    """Query Google AI Studio /v1beta/models to list generateContent-capable models."""
+    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key:
+        return []
+    root = (base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    url = f"{root}/models"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(url, params={"key": key})
+        resp.raise_for_status()
+        payload = resp.json()
+
+    models: list[str] = []
+    for item in payload.get("models", []):
+        methods = item.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        raw_name = str(item.get("name", ""))
+        model_id = raw_name.removeprefix("models/")
+        if model_id:
+            models.append(model_id)
+    return models

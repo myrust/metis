@@ -161,6 +161,7 @@ class MetisAgentRunner:
         system_prompt: str | None = None,
         model: str | None = None,
         task_type: str | None = None,
+        provider_id: str | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         """Run the agent loop and yield RuntimeEvent items for SSE."""
         breaker = LoopCircuitBreaker(threshold=3)
@@ -174,7 +175,11 @@ class MetisAgentRunner:
                 model=model,
             )
             step_chunks: list[str] = []
-            async for ev in self.router.stream(req, task_type=task_type):
+            async for ev in self.router.stream(
+                req,
+                task_type=task_type,
+                provider_id=provider_id,
+            ):
                 if ev.kind == "thinking":
                     yield RuntimeEvent("thinking", {"content": ev.content})
                 elif ev.kind == "text_delta":

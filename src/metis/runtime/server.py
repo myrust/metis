@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +24,7 @@ from metis.providers.api_adapter import (
     OpenAICompatProvider,
 )
 from metis.providers.codex_cli import CodexCliProvider
-from metis.providers.models_registry import ModelsRegistry
+from metis.providers.models_registry import ModelsRegistry, discover_gemini_models
 from metis.providers.router import ProviderRouter
 from metis.runtime.agent import MetisAgentRunner
 from metis.runtime.approval import ApprovalGate
@@ -38,6 +39,7 @@ class ChatRequest(BaseModel):
     system_prompt: str | None = None
     model: str | None = None
     task_type: str | None = None
+    provider_id: str | None = None
 
 
 class ApprovalDecision(BaseModel):
@@ -132,7 +134,11 @@ def create_app(
         local_workspace=cfg.workspace_dir,
         config_file=config_file,
     )
-    active_router = router or build_default_router(cfg)
+    active_router = router or models_registry.build_provider_router(
+        codex_bin=cfg.codex_bin,
+        workspace_dir=cfg.workspace_dir,
+    )
+    custom_router_injected = router is not None
     skills = SkillRegistry(_default_skill_dirs(cfg))
     distiller = SkillDistiller(skills_repo_dir, provider=None)
     mnemosyne = memory or MnemosyneMemory(
@@ -211,6 +217,7 @@ def create_app(
                 system_prompt=body.system_prompt,
                 model=body.model,
                 task_type=body.task_type,
+                provider_id=body.provider_id,
             ):
                 yield event.to_sse_dict()
 
@@ -359,7 +366,39 @@ def create_app(
             payload["roles"] = body.roles
         models_registry.update_from_dict(payload)
         mnemosyne.memory_config = models_registry.resolve_mnemosyne_config(cfg.memory)
+        if not custom_router_injected:
+            refreshed = models_registry.build_provider_router(
+                codex_bin=cfg.codex_bin,
+                workspace_dir=cfg.workspace_dir,
+            )
+            runner.router = refreshed
+            app.state.router = refreshed
         return models_registry.to_dict()
+
+    @app.get("/api/models/discover")
+    async def discover_models() -> dict[str, Any]:
+        gemini_entry = models_registry.providers.get("gemini")
+        live_gemini: list[str] = []
+        discover_error: str | None = None
+        try:
+            live_gemini = await discover_gemini_models(
+                api_key=gemini_entry.api_key if gemini_entry else None,
+                base_url=gemini_entry.base_url if gemini_entry else None,
+            )
+        except (httpx.HTTPError, ValueError, OSError) as exc:  # pragma: no cover - network dependent
+            discover_error = str(exc)
+
+        options: list[dict[str, str]] = [
+            {"provider_id": "gemini", "model": m} for m in live_gemini
+        ]
+        seen = {(o["provider_id"], o["model"]) for o in options}
+        for entry in models_registry.providers.values():
+            if entry.enabled and entry.default_model:
+                key = (entry.id, entry.default_model)
+                if key not in seen:
+                    options.append({"provider_id": entry.id, "model": entry.default_model})
+                    seen.add(key)
+        return {"models": options, "error": discover_error}
 
     @app.post("/api/backup/run")
     async def run_backup_now() -> dict[str, Any]:

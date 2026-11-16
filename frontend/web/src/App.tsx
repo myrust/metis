@@ -57,6 +57,10 @@ export default function App() {
     jobs: [],
   })
   const [models, setModels] = useState<ModelsPayload | null>(null)
+  const [discoveredModels, setDiscoveredModels] = useState<
+    Array<{ provider_id: string; model: string }>
+  >([])
+  const [selectedModelKey, setSelectedModelKey] = useState<string>('auto')
   const [backupStatus, setBackupStatus] = useState<string>('')
 
   const [prompt, setPrompt] = useState('')
@@ -76,13 +80,14 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     try {
-      const [h, n, s, f, c, m] = await Promise.all([
+      const [h, n, s, f, c, m, d] = await Promise.all([
         api.health(),
         api.nodes(),
         api.skills(),
         api.workspaceFiles(),
         api.cron(),
         api.models(),
+        api.discoverModels(),
       ])
       setHealth(h)
       setNodes(n.nodes)
@@ -91,6 +96,7 @@ export default function App() {
       setFiles(f.files)
       setCronInfo(c)
       setModels(m)
+      setDiscoveredModels(d.models)
     } catch {
       // Backend might not be running yet during standalone preview.
     }
@@ -108,9 +114,14 @@ export default function App() {
     setStreaming(true)
     setTimeline((prev) => [...prev, { id: `u-${Date.now()}`, kind: 'user', text }])
 
+    const [pinnedProvider, pinnedModel] =
+      selectedModelKey === 'auto' ? [undefined, undefined] : selectedModelKey.split('::')
+
     let assistantBuffer = ''
     try {
-      await streamChat(text, (ev) => {
+      await streamChat(
+        text,
+        (ev) => {
         if (ev.event === 'thinking') {
           if (typeof ev.data.delta === 'string') {
             assistantBuffer += ev.data.delta
@@ -160,7 +171,9 @@ export default function App() {
             { id: `a-${Date.now()}`, kind: 'assistant', text: finalContent },
           ])
         }
-      })
+      },
+        { provider_id: pinnedProvider, model: pinnedModel },
+      )
     } catch (err) {
       setTimeline((prev) => [
         ...prev,
@@ -465,12 +478,28 @@ export default function App() {
 
                     <form
                       onSubmit={(e) => void handleSend(e)}
-                      className={`mt-3 flex items-center gap-2 rounded-full border px-4 py-2 ${innerSurface}`}
+                      className={`mt-3 flex items-center gap-2 rounded-full border px-3 py-1.5 ${innerSurface}`}
                     >
+                      <select
+                        value={selectedModelKey}
+                        onChange={(e) => setSelectedModelKey(e.target.value)}
+                        title="切换模型或自动路由"
+                        className="max-w-[150px] truncate rounded-full bg-zinc-500/10 px-2.5 py-1 text-[11px] font-medium outline-none"
+                      >
+                        <option value="auto">Auto (Router)</option>
+                        {discoveredModels.map((item) => {
+                          const key = `${item.provider_id}::${item.model}`
+                          return (
+                            <option key={key} value={key}>
+                              {item.model} ({item.provider_id})
+                            </option>
+                          )
+                        })}
+                      </select>
                       <input
                         value={prompt}
                         onChange={(e) => setPrompt(e.target.value)}
-                        placeholder={`向 Metis 发送指令（当前节点: ${activeNodeId}）...`}
+                        placeholder={`向 Metis 发送指令（${activeNodeId}）...`}
                         className="flex-1 bg-transparent text-sm outline-none"
                       />
                       <button
@@ -685,7 +714,16 @@ export default function App() {
               </section>
 
               <section className={`${cardClass} p-6`}>
-                <h2 className="text-lg font-semibold">模型注册表 (~/.metis/models.json)</h2>
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold">模型注册表 (~/.metis/models.json)</h2>
+                  <button
+                    type="button"
+                    onClick={() => void refreshAll()}
+                    className="rounded-full bg-zinc-900 px-3 py-1 text-xs font-medium text-white dark:bg-white dark:text-zinc-900"
+                  >
+                    拉取可用模型 ({discoveredModels.length})
+                  </button>
+                </div>
                 <div className="mt-4 space-y-3">
                   {models &&
                     Object.entries(models.roles).map(([roleName, route]) => (

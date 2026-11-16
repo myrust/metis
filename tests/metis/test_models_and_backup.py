@@ -13,7 +13,9 @@ from fastapi.testclient import TestClient
 
 from metis.automation.backup import BackupService
 from metis.config import BackupConfig, MetisConfig
+from metis.providers import models_registry as reg_mod
 from metis.providers.base import BaseModelProvider, ProviderRequest, ProviderStreamEvent
+from metis.providers.models_registry import ModelsRegistry, discover_gemini_models
 from metis.providers.router import ProviderRouter
 from metis.runtime.approval import is_sensitive_command
 from metis.runtime.server import create_app
@@ -123,3 +125,54 @@ def test_api_models_and_backup_endpoints(tmp_path: Path) -> None:
     backup_res = client.post("/api/backup/run")
     assert backup_res.status_code == 200
     assert backup_res.json()["status"] == "completed"
+
+    disc_res = client.get("/api/models/discover")
+    assert disc_res.status_code == 200
+    assert any(m["provider_id"] == "gemini" for m in disc_res.json()["models"])
+
+
+@pytest.mark.asyncio
+async def test_discover_gemini_models_and_router_hot_reload(monkeypatch, tmp_path: Path) -> None:
+    class _FakeResp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "models": [
+                    {
+                        "name": "models/gemini-4-flash",
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                    {
+                        "name": "models/gemini-4-pro",
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                    {
+                        "name": "models/embedding-001",
+                        "supportedGenerationMethods": ["embedContent"],
+                    },
+                ]
+            }
+
+    class _FakeClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return _FakeResp()
+
+    monkeypatch.setattr(reg_mod.httpx, "AsyncClient", _FakeClient)
+    found = await discover_gemini_models(api_key="fake-gemini-key")
+    assert found == ["gemini-4-flash", "gemini-4-pro"]
+
+    registry = ModelsRegistry(tmp_path / "models.json")
+    registry.providers["gemini"].api_key = "fake-gemini-key"
+    router = registry.build_provider_router()
+    assert [p.name for p in router.candidates_for(provider_id="gemini")] == ["gemini"]
