@@ -29,9 +29,10 @@ class _DummyProvider(BaseModelProvider):
 
 
 def test_node_router_defaults_and_persistence(tmp_path: Path) -> None:
-    nodes_file = tmp_path / "nodes.yaml"
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"port": 9119}', encoding="utf-8")
     ws = tmp_path / "ws"
-    router = NodeRouter(local_workspace=ws, nodes_file=nodes_file)
+    router = NodeRouter(local_workspace=ws, config_file=config_file)
 
     assert router.active_node_id == "local"
     assert router.get_node().kind == "local"
@@ -42,24 +43,35 @@ def test_node_router_defaults_and_persistence(tmp_path: Path) -> None:
             kind="ssh",
             host="gpu.internal",
             workspace="/home/dev/ws",
+            allowed_paths=["/home/dev/projects"],
             description="A100 node",
         )
     )
     router.activate("gpu-box")
     assert "gpu-box [active]" in router.render_prompt_index()
 
-    reloaded = NodeRouter(local_workspace=ws, nodes_file=nodes_file)
+    reloaded = NodeRouter(local_workspace=ws, config_file=config_file)
     assert reloaded.active_node_id == "gpu-box"
     assert reloaded.get_node("gpu-box").host == "gpu.internal"
+    assert reloaded.get_node("gpu-box").allowed_paths == ["/home/dev/projects"]
+    assert '"port": 9119' in config_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
 async def test_node_router_local_and_mocked_ssh(tmp_path: Path) -> None:
-    router = NodeRouter(local_workspace=tmp_path / "ws", nodes_file=tmp_path / "nodes.yaml")
+    router = NodeRouter(local_workspace=tmp_path / "ws", config_file=tmp_path / "config.json")
     await router.write_file("a.txt", "hello\nworld\n", node_id="local")
     assert await router.read_lines("a.txt", 1, 2, node_id="local") == "1: hello\n2: world"
 
-    router.add_node(NodeConfig(id="remote", kind="ssh", host="remote-host", workspace="/srv/ws"))
+    router.add_node(
+        NodeConfig(
+            id="remote",
+            kind="ssh",
+            host="remote-host",
+            workspace="/srv/ws",
+            allowed_paths=["/srv/projects"],
+        )
+    )
 
     mock_conn = MagicMock()
     mock_conn.is_closed.return_value = False
@@ -73,8 +85,12 @@ async def test_node_router_local_and_mocked_ssh(tmp_path: Path) -> None:
     called_cmd = mock_conn.run.call_args.args[0]
     assert called_cmd.startswith("cd /srv/ws && uname -a")
 
+    assert (
+        router._resolve_remote_path("/srv/ws", "/srv/projects/app.py", ["/srv/projects"])
+        == "/srv/projects/app.py"
+    )
     with pytest.raises(WorkspaceViolationError):
-        router._resolve_remote_path("/srv/ws", "../../etc/passwd")
+        router._resolve_remote_path("/srv/ws", "../../etc/passwd", ["/srv/projects"])
 
 
 def test_api_nodes_crud_and_activate(tmp_path: Path) -> None:

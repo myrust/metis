@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -10,25 +11,32 @@ class WorkspaceViolationError(PermissionError):
 
 
 class WorkspaceGuard:
-    """Confines file reads/writes/edits to a single root workspace directory."""
+    """Confines file reads/writes/edits to workspace_dir and optional allowed_paths."""
 
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(self, workspace_dir: Path, allowed_paths: Iterable[Path | str] = ()) -> None:
         self.root = workspace_dir.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.allowed_roots: list[Path] = [self.root]
+        for extra in allowed_paths:
+            resolved = Path(extra).expanduser().resolve()
+            if resolved not in self.allowed_roots:
+                self.allowed_roots.append(resolved)
 
     def resolve_path(self, relative_or_abs: str | Path) -> Path:
-        """Resolve a path and verify it stays within self.root."""
+        """Resolve a path and verify it stays within self.root or allowed_roots."""
         candidate = Path(relative_or_abs).expanduser()
         if not candidate.is_absolute():
             candidate = self.root / candidate
         resolved = candidate.resolve()
-        try:
-            resolved.relative_to(self.root)
-        except ValueError as exc:
-            raise WorkspaceViolationError(
-                f"Path '{relative_or_abs}' escapes workspace '{self.root}'."
-            ) from exc
-        return resolved
+        for allowed in self.allowed_roots:
+            try:
+                resolved.relative_to(allowed)
+                return resolved
+            except ValueError:
+                continue
+        raise WorkspaceViolationError(
+            f"Path '{relative_or_abs}' escapes workspace '{self.root}' and allowed_paths."
+        )
 
     def read_lines(
         self,

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from metis.automation.backup import BackupService
 from metis.automation.cron import CronHeartbeatService
 from metis.config import MetisConfig
 from metis.memory.mnemosyne import MnemosyneMemory
@@ -22,6 +23,7 @@ from metis.providers.api_adapter import (
     OpenAICompatProvider,
 )
 from metis.providers.codex_cli import CodexCliProvider
+from metis.providers.models_registry import ModelsRegistry
 from metis.providers.router import ProviderRouter
 from metis.runtime.agent import MetisAgentRunner
 from metis.runtime.approval import ApprovalGate
@@ -64,9 +66,15 @@ class NodeUpsertRequest(BaseModel):
     kind: str = "ssh"
     host: str
     workspace: str
+    allowed_paths: list[str] = []
     user: str | None = None
     port: int | None = None
     description: str = ""
+
+
+class ModelsUpdateRequest(BaseModel):
+    providers: list[dict[str, Any]] | None = None
+    roles: dict[str, dict[str, Any]] | None = None
 
 
 def build_default_router(config: MetisConfig) -> ProviderRouter:
@@ -86,7 +94,9 @@ def _default_skill_dirs(config: MetisConfig) -> list[Path]:
     repo_skills = Path(__file__).resolve().parents[3] / "skills"
     if repo_skills.is_dir():
         dirs.append(repo_skills)
-    dirs.append(config.skills_dir)
+    for candidate in (config.skills_dir, config.skills_repo_dir):
+        if candidate not in dirs:
+            dirs.append(candidate)
     return dirs
 
 
@@ -99,17 +109,45 @@ def create_app(
     cfg = config or MetisConfig.load()
     cfg.ensure_directories()
 
+    models_file = (
+        cfg.models_file
+        if str(cfg.models_file) != "."
+        else (cfg.home_dir / "models.json")
+    )
+    config_file = (
+        cfg.config_file
+        if str(cfg.config_file) != "."
+        else (cfg.home_dir / "config.json")
+    )
+    skills_repo_dir = (
+        cfg.skills_repo_dir
+        if str(cfg.skills_repo_dir) != "."
+        else cfg.skills_dir
+    )
+
+    models_registry = ModelsRegistry(models_file)
     gate = ApprovalGate()
     workspace = WorkspaceGuard(cfg.workspace_dir)
     node_router = NodeRouter(
         local_workspace=cfg.workspace_dir,
-        nodes_file=cfg.home_dir / "nodes.yaml",
+        config_file=config_file,
     )
     active_router = router or build_default_router(cfg)
     skills = SkillRegistry(_default_skill_dirs(cfg))
-    distiller = SkillDistiller(cfg.skills_dir, provider=None)
-    mnemosyne = memory or MnemosyneMemory(graph_dir=cfg.graph_dir, memory_config=cfg.memory)
+    distiller = SkillDistiller(skills_repo_dir, provider=None)
+    mnemosyne = memory or MnemosyneMemory(
+        graph_dir=cfg.graph_dir,
+        memory_config=models_registry.resolve_mnemosyne_config(cfg.memory),
+    )
+    backup_service = BackupService(cfg.backup)
     cron = CronHeartbeatService(enabled=cfg.cron_enabled)
+
+    async def _cron_backup(_job_name: str) -> None:
+        backup_service.run_backup()
+
+    if cfg.backup.target_dir is not None:
+        cron.register("workspace-backup", cfg.backup.cron, _cron_backup)
+
     runner = MetisAgentRunner(
         router=active_router,
         workspace=workspace,
@@ -130,12 +168,14 @@ def create_app(
     app = FastAPI(title="Metis Backend", version="0.1.0", lifespan=lifespan)
 
     app.state.config = cfg
+    app.state.models_registry = models_registry
     app.state.approval_gate = gate
     app.state.workspace = workspace
     app.state.node_router = node_router
     app.state.router = active_router
     app.state.skills = skills
     app.state.memory = mnemosyne
+    app.state.backup_service = backup_service
     app.state.cron = cron
     app.state.runner = runner
 
@@ -257,6 +297,7 @@ def create_app(
                     "kind": n.kind,
                     "host": n.host,
                     "workspace": n.workspace,
+                    "allowed_paths": n.allowed_paths,
                     "user": n.user,
                     "port": n.port,
                     "description": n.description,
@@ -273,12 +314,19 @@ def create_app(
                 kind=body.kind,
                 host=body.host,
                 workspace=body.workspace,
+                allowed_paths=body.allowed_paths,
                 user=body.user,
                 port=body.port,
                 description=body.description,
             )
         )
-        return {"id": node.id, "kind": node.kind, "host": node.host, "workspace": node.workspace}
+        return {
+            "id": node.id,
+            "kind": node.kind,
+            "host": node.host,
+            "workspace": node.workspace,
+            "allowed_paths": node.allowed_paths,
+        }
 
     @app.delete("/api/nodes/{node_id}")
     async def delete_node(node_id: str) -> dict[str, str]:
@@ -297,6 +345,30 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Unknown node_id: {node_id}") from exc
         return {"active_node_id": node.id}
+
+    @app.get("/api/models")
+    async def get_models() -> dict[str, Any]:
+        return models_registry.to_dict()
+
+    @app.post("/api/models")
+    async def update_models(body: ModelsUpdateRequest) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if body.providers is not None:
+            payload["providers"] = body.providers
+        if body.roles is not None:
+            payload["roles"] = body.roles
+        models_registry.update_from_dict(payload)
+        mnemosyne.memory_config = models_registry.resolve_mnemosyne_config(cfg.memory)
+        return models_registry.to_dict()
+
+    @app.post("/api/backup/run")
+    async def run_backup_now() -> dict[str, Any]:
+        try:
+            return backup_service.run_backup()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # Optional static frontend mount point (left empty in Phase 1).
     if cfg.static_dir and cfg.static_dir.is_dir():

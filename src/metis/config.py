@@ -54,6 +54,16 @@ class MnemosyneConfig:
 
 
 @dataclass(frozen=True)
+class BackupConfig:
+    """Cross-platform mount directory backup configuration (no hardcoded target path)."""
+
+    target_dir: Path | None = None
+    source_dirs: tuple[Path, ...] = ()
+    cron: str = "0 3 * * *"
+    retention_days: int = 7
+
+
+@dataclass(frozen=True)
 class MetisConfig:
     """Resolved cross-platform configuration for the Metis backend."""
 
@@ -61,12 +71,16 @@ class MetisConfig:
     workspace_dir: Path
     graph_dir: Path
     skills_dir: Path
+    skills_repo_dir: Path = Path(".")
+    config_file: Path = Path(".")
+    models_file: Path = Path(".")
     static_dir: Path | None = None
     host: str = "127.0.0.1"
     port: int = 9119
     codex_bin: str | None = None
     telegram_enabled: bool = False
     cron_enabled: bool = False
+    backup: BackupConfig = field(default_factory=BackupConfig)
     memory: MnemosyneConfig = field(
         default_factory=lambda: MnemosyneConfig(
             llm=MemoryRoleConfig(_QWEN_COMPAT_BASE_URL, None, "qwen-plus"),
@@ -133,17 +147,48 @@ class MetisConfig:
             ),
         )
 
+        workspace_dir = _path("METIS_WORKSPACE", "workspace_dir", home / "workspace")
+        graph_dir = _path("METIS_GRAPH_DIR", "graph_dir", home / "memory" / "graph")
+        skills_dir = _path("METIS_SKILLS_DIR", "skills_dir", home / "skills")
+        skills_repo_dir = _path("METIS_SKILLS_REPO_DIR", "skills_repo_dir", skills_dir)
+        models_file = _path("METIS_MODELS_FILE", "models_file", home / "models.json")
+
+        backup_raw = raw.get("backup") if isinstance(raw.get("backup"), dict) else {}
+        backup_target_val = os.environ.get("METIS_BACKUP_TARGET_DIR") or backup_raw.get("target_dir")
+        backup_target = (
+            Path(backup_target_val).expanduser().resolve() if backup_target_val else None
+        )
+        raw_sources = backup_raw.get("source_dirs")
+        if isinstance(raw_sources, list) and raw_sources:
+            source_dirs = tuple(Path(str(p)).expanduser().resolve() for p in raw_sources)
+        else:
+            source_dirs = (workspace_dir, graph_dir)
+        backup_cfg = BackupConfig(
+            target_dir=backup_target,
+            source_dirs=source_dirs,
+            cron=str(os.environ.get("METIS_BACKUP_CRON") or backup_raw.get("cron") or "0 3 * * *"),
+            retention_days=int(
+                os.environ.get("METIS_BACKUP_RETENTION_DAYS")
+                or backup_raw.get("retention_days")
+                or 7
+            ),
+        )
+
         return cls(
             home_dir=home,
-            workspace_dir=_path("METIS_WORKSPACE", "workspace_dir", home / "workspace"),
-            graph_dir=_path("METIS_GRAPH_DIR", "graph_dir", home / "memory" / "graph"),
-            skills_dir=_path("METIS_SKILLS_DIR", "skills_dir", home / "skills"),
+            workspace_dir=workspace_dir,
+            graph_dir=graph_dir,
+            skills_dir=skills_dir,
+            skills_repo_dir=skills_repo_dir,
+            config_file=cfg_file.expanduser().resolve(),
+            models_file=models_file,
             static_dir=_opt_path("METIS_STATIC_DIR", "static_dir"),
             host=str(os.environ.get("METIS_HOST") or raw.get("host") or "127.0.0.1"),
             port=int(os.environ.get("METIS_PORT") or raw.get("port") or 9119),
             codex_bin=str(codex_override) if codex_override else shutil.which("codex"),
             telegram_enabled=_bool("METIS_TELEGRAM_ENABLED", "telegram_enabled", False),
             cron_enabled=_bool("METIS_CRON_ENABLED", "cron_enabled", False),
+            backup=backup_cfg,
             memory=memory_cfg,
             extra=raw,
         )

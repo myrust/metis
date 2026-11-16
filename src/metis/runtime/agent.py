@@ -51,7 +51,7 @@ class MetisAgentRunner:
         self.skills = skills
         self.node_router = node_router or NodeRouter(
             local_workspace=workspace.root,
-            nodes_file=workspace.root.parent / "nodes.yaml",
+            config_file=workspace.root.parent / "config.json",
         )
         self.max_steps = max_steps
         self.approval_timeout = approval_timeout

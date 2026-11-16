@@ -16,6 +16,7 @@ _SENSITIVE_SHELL_PATTERNS = (
     re.compile(r"\b(mkfs|dd|fdisk|shutdown|reboot)\b", re.IGNORECASE),
     re.compile(r"\bchmod\s+-R\b", re.IGNORECASE),
     re.compile(r"(curl|wget)[^\n]*\|\s*(sh|bash|zsh)", re.IGNORECASE),
+    re.compile(r"\bgit\s+(push|reset|rebase|clean\s+-[^\n]*f|checkout\s+--|branch\s+-D)\b", re.IGNORECASE),
 )
 
 

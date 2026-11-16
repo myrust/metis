@@ -1,28 +1,33 @@
-"""Multi-node execution target router (local native + agentless SSH/SFTP via asyncssh)."""
+"""Multi-node execution target router (local native + agentless SSH/SFTP via asyncssh).
+
+Reads and persists `nodes` and `active_node_id` directly inside ~/.metis/config.json
+with zero separate nodes config file.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import posixpath
 import shlex
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import asyncssh
-import yaml
 
 from metis.runtime.workspace import WorkspaceGuard, WorkspaceViolationError
 
 
 @dataclass
 class NodeConfig:
-    """Execution target definition (local or SSH host)."""
+    """Execution target definition (local or SSH host) with workspace and allowed_paths."""
 
     id: str
     kind: str = "ssh"  # "local" | "ssh"
     host: str = "localhost"
     workspace: str = "."
+    allowed_paths: list[str] = field(default_factory=list)
     user: str | None = None
     port: int | None = None
     description: str = ""
@@ -34,11 +39,11 @@ class NodeRouter:
     def __init__(
         self,
         local_workspace: Path,
-        nodes_file: Path,
+        config_file: Path,
         ssh_config_path: Path | None = None,
     ) -> None:
-        self.local_guard = WorkspaceGuard(local_workspace)
-        self.nodes_file = Path(nodes_file).expanduser().resolve()
+        self.local_workspace = Path(local_workspace).expanduser().resolve()
+        self.config_file = Path(config_file).expanduser().resolve()
         self.ssh_config_path = (
             Path(ssh_config_path).expanduser().resolve()
             if ssh_config_path is not None
@@ -46,6 +51,7 @@ class NodeRouter:
         )
         self._nodes: dict[str, NodeConfig] = {}
         self.active_node_id: str = "local"
+        self.local_guard = WorkspaceGuard(self.local_workspace)
         self._ssh_pool: dict[str, asyncssh.SSHClientConnection] = {}
         self._pool_lock = asyncio.Lock()
         self.reload()
@@ -56,42 +62,57 @@ class NodeRouter:
                 id="local",
                 kind="local",
                 host="localhost",
-                workspace=str(self.local_guard.root),
+                workspace=str(self.local_workspace),
+                allowed_paths=[str(self.local_workspace)],
                 description="Local machine workspace",
             )
+        local_node = self._nodes["local"]
+        self.local_guard = WorkspaceGuard(
+            Path(local_node.workspace),
+            allowed_paths=local_node.allowed_paths,
+        )
+
+    def _read_config_json(self) -> dict[str, Any]:
+        if not self.config_file.is_file():
+            return {}
+        try:
+            data = json.loads(self.config_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
 
     def reload(self) -> None:
-        """Load nodes and active_node_id from nodes.yaml, always preserving built-in local."""
+        """Load nodes and active_node_id from config.json, always preserving built-in local."""
         self._nodes = {}
         self.active_node_id = "local"
-        if self.nodes_file.is_file():
-            raw = yaml.safe_load(self.nodes_file.read_text(encoding="utf-8")) or {}
-            if isinstance(raw, dict):
-                for item in raw.get("nodes", []):
-                    if isinstance(item, dict) and item.get("id"):
-                        node = NodeConfig(
-                            id=str(item["id"]),
-                            kind=str(item.get("kind", "ssh")),
-                            host=str(item.get("host", "localhost")),
-                            workspace=str(item.get("workspace", "~")),
-                            user=item.get("user"),
-                            port=int(item["port"]) if item.get("port") is not None else None,
-                            description=str(item.get("description", "")),
-                        )
-                        self._nodes[node.id] = node
-                if raw.get("active_node_id") in self._nodes:
-                    self.active_node_id = str(raw["active_node_id"])
+        raw = self._read_config_json()
+        for item in raw.get("nodes", []):
+            if isinstance(item, dict) and item.get("id"):
+                ws = str(item.get("workspace", "~"))
+                allowed = [str(p) for p in item.get("allowed_paths", []) if p]
+                node = NodeConfig(
+                    id=str(item["id"]),
+                    kind=str(item.get("kind", "ssh")),
+                    host=str(item.get("host", "localhost")),
+                    workspace=ws,
+                    allowed_paths=allowed,
+                    user=item.get("user"),
+                    port=int(item["port"]) if item.get("port") is not None else None,
+                    description=str(item.get("description", "")),
+                )
+                self._nodes[node.id] = node
+        if raw.get("active_node_id") in self._nodes:
+            self.active_node_id = str(raw["active_node_id"])
         self._ensure_local_node()
 
     def save(self) -> None:
-        """Persist nodes and active_node_id to nodes.yaml."""
-        self.nodes_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "active_node_id": self.active_node_id,
-            "nodes": [asdict(n) for n in self._nodes.values()],
-        }
-        self.nodes_file.write_text(
-            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        """Persist nodes and active_node_id into config.json without clobbering other keys."""
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+        raw = self._read_config_json()
+        raw["active_node_id"] = self.active_node_id
+        raw["nodes"] = [asdict(n) for n in self._nodes.values()]
+        self.config_file.write_text(
+            json.dumps(raw, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
@@ -107,6 +128,11 @@ class NodeRouter:
 
     def add_node(self, node: NodeConfig) -> NodeConfig:
         self._nodes[node.id] = node
+        if node.id == "local":
+            self.local_guard = WorkspaceGuard(
+                Path(node.workspace),
+                allowed_paths=node.allowed_paths,
+            )
         self.save()
         return node
 
@@ -136,8 +162,10 @@ class NodeRouter:
         for node in self._nodes.values():
             marker = " [active]" if node.id == self.active_node_id else ""
             desc = f" — {node.description}" if node.description else ""
+            allowed = f", allowed_paths={node.allowed_paths}" if node.allowed_paths else ""
             lines.append(
-                f"- {node.id}{marker} ({node.kind}, host={node.host}, workspace={node.workspace}){desc}"
+                f"- {node.id}{marker} ({node.kind}, host={node.host}, "
+                f"workspace={node.workspace}{allowed}){desc}"
             )
         return "\n".join(lines)
 
@@ -166,18 +194,24 @@ class NodeRouter:
         self._ssh_pool.clear()
 
     @staticmethod
-    def _resolve_remote_path(workspace: str, rel_or_abs: str) -> str:
+    def _resolve_remote_path(
+        workspace: str,
+        rel_or_abs: str,
+        allowed_paths: list[str] | None = None,
+    ) -> str:
         base = posixpath.normpath(workspace)
         candidate = (
             posixpath.normpath(rel_or_abs)
             if rel_or_abs.startswith("/")
             else posixpath.normpath(posixpath.join(base, rel_or_abs))
         )
-        if candidate != base and not candidate.startswith(base.rstrip("/") + "/"):
-            raise WorkspaceViolationError(
-                f"Remote path '{rel_or_abs}' escapes workspace '{workspace}'."
-            )
-        return candidate
+        roots = [base, *[posixpath.normpath(p) for p in (allowed_paths or []) if p]]
+        for root in roots:
+            if candidate == root or candidate.startswith(root.rstrip("/") + "/"):
+                return candidate
+        raise WorkspaceViolationError(
+            f"Remote path '{rel_or_abs}' escapes workspace '{workspace}' and allowed_paths."
+        )
 
     async def run_shell(self, command: str, node_id: str | None = None) -> tuple[bool, str]:
         node = self.get_node(node_id)
@@ -212,12 +246,14 @@ class NodeRouter:
                 return False, f"Directory not found: {subdir}"
             items = sorted(
                 str(p.relative_to(self.local_guard.root))
+                if p.is_relative_to(self.local_guard.root)
+                else str(p)
                 for p in target.rglob("*")
                 if p.is_file()
             )
             return True, "\n".join(items) if items else "(empty)"
 
-        remote_dir = self._resolve_remote_path(node.workspace, subdir)
+        remote_dir = self._resolve_remote_path(node.workspace, subdir, node.allowed_paths)
         conn = await self._get_ssh_conn(node)
         async with conn.start_sftp_client() as sftp:
             entries = await sftp.listdir(remote_dir)
@@ -235,7 +271,7 @@ class NodeRouter:
         if node.kind == "local":
             return self.local_guard.read_lines(path, start_line=start_line, end_line=end_line)
 
-        remote_path = self._resolve_remote_path(node.workspace, path)
+        remote_path = self._resolve_remote_path(node.workspace, path, node.allowed_paths)
         conn = await self._get_ssh_conn(node)
         async with conn.start_sftp_client() as sftp, sftp.open(remote_path, "r") as fh:
             content = await fh.read()
@@ -251,9 +287,9 @@ class NodeRouter:
         node = self.get_node(node_id)
         if node.kind == "local":
             written = self.local_guard.write_file(path, content)
-            return f"Wrote {written.relative_to(self.local_guard.root)} on local"
+            return f"Wrote {written} on local"
 
-        remote_path = self._resolve_remote_path(node.workspace, path)
+        remote_path = self._resolve_remote_path(node.workspace, path, node.allowed_paths)
         conn = await self._get_ssh_conn(node)
         async with conn.start_sftp_client() as sftp:
             parent = posixpath.dirname(remote_path)
@@ -273,9 +309,9 @@ class NodeRouter:
         node = self.get_node(node_id)
         if node.kind == "local":
             edited = self.local_guard.apply_diff(path, target_snippet, replacement)
-            return f"Updated {edited.relative_to(self.local_guard.root)} on local"
+            return f"Updated {edited} on local"
 
-        remote_path = self._resolve_remote_path(node.workspace, path)
+        remote_path = self._resolve_remote_path(node.workspace, path, node.allowed_paths)
         conn = await self._get_ssh_conn(node)
         async with conn.start_sftp_client() as sftp:
             async with sftp.open(remote_path, "r") as fh:

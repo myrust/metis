@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,7 +16,7 @@ def _slugify(name: str) -> str:
 
 
 class SkillDistiller:
-    """Distills a session transcript into a structured SKILL.md saved under skills_dir."""
+    """Distills a session transcript into a structured SKILL.md saved under skills_repo_dir."""
 
     def __init__(self, skills_dir: Path, provider: BaseModelProvider | None = None) -> None:
         self.skills_dir = Path(skills_dir).expanduser().resolve()
@@ -26,8 +27,9 @@ class SkillDistiller:
         skill_name: str,
         description: str,
         transcript: Sequence[str],
+        auto_sync_git: bool = False,
     ) -> Path:
-        """Create a SKILL.md from session messages using provider or structured fallback."""
+        """Create a SKILL.md from session messages and optionally sync via native git CLI."""
         slug = _slugify(skill_name)
         body: str | None = None
 
@@ -53,4 +55,26 @@ class SkillDistiller:
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / "SKILL.md"
         target_file.write_text(content, encoding="utf-8")
+
+        if auto_sync_git and (self.skills_dir / ".git").exists():
+            await self._git_commit_and_push(target_file, slug)
+
         return target_file
+
+    async def _git_commit_and_push(self, skill_file: Path, slug: str) -> None:
+        """Invoke native git CLI inside skills_repo_dir to commit and push a new SKILL.md."""
+        rel = str(skill_file.relative_to(self.skills_dir))
+        for cmd in (
+            ["git", "add", rel],
+            ["git", "commit", "-m", f"feat(skills): distill {slug}"],
+            ["git", "push"],
+        ):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self.skills_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode != 0:
+                break
