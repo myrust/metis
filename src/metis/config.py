@@ -31,6 +31,28 @@ def _load_json_config(config_path: Path) -> dict[str, Any]:
         return {}
 
 
+_QWEN_COMPAT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+@dataclass(frozen=True)
+class MemoryRoleConfig:
+    """OpenAI-compatible endpoint config for one Mnemosyne role."""
+
+    base_url: str
+    api_key: str | None
+    model: str
+
+
+@dataclass(frozen=True)
+class MnemosyneConfig:
+    """Multi-role cloud API routing config for Mnemosyne (LLM / Embedding / Vision)."""
+
+    llm: MemoryRoleConfig
+    embedding: MemoryRoleConfig
+    vision: MemoryRoleConfig
+    embedding_dim: int = 1024
+
+
 @dataclass(frozen=True)
 class MetisConfig:
     """Resolved cross-platform configuration for the Metis backend."""
@@ -45,6 +67,13 @@ class MetisConfig:
     codex_bin: str | None = None
     telegram_enabled: bool = False
     cron_enabled: bool = False
+    memory: MnemosyneConfig = field(
+        default_factory=lambda: MnemosyneConfig(
+            llm=MemoryRoleConfig(_QWEN_COMPAT_BASE_URL, None, "qwen-plus"),
+            embedding=MemoryRoleConfig(_QWEN_COMPAT_BASE_URL, None, "text-embedding-v3"),
+            vision=MemoryRoleConfig(_QWEN_COMPAT_BASE_URL, None, "qwen-vl-plus"),
+        )
+    )
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -71,6 +100,39 @@ class MetisConfig:
 
         codex_override = os.environ.get("METIS_CODEX_BIN") or raw.get("codex_bin")
 
+        mem_raw = raw.get("memory") if isinstance(raw.get("memory"), dict) else {}
+        shared_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+
+        def _role(role: str, env_prefix: str, default_model: str) -> MemoryRoleConfig:
+            role_raw = mem_raw.get(role) if isinstance(mem_raw.get(role), dict) else {}
+            base_url = str(
+                os.environ.get(f"{env_prefix}_BASE_URL")
+                or role_raw.get("base_url")
+                or _QWEN_COMPAT_BASE_URL
+            )
+            api_key = (
+                os.environ.get(f"{env_prefix}_API_KEY")
+                or role_raw.get("api_key")
+                or shared_key
+            )
+            model = str(
+                os.environ.get(f"{env_prefix}_MODEL")
+                or role_raw.get("model")
+                or default_model
+            )
+            return MemoryRoleConfig(base_url=base_url, api_key=api_key, model=model)
+
+        memory_cfg = MnemosyneConfig(
+            llm=_role("llm", "METIS_MEMORY_LLM", "qwen-plus"),
+            embedding=_role("embedding", "METIS_MEMORY_EMBEDDING", "text-embedding-v3"),
+            vision=_role("vision", "METIS_MEMORY_VISION", "qwen-vl-plus"),
+            embedding_dim=int(
+                os.environ.get("METIS_MEMORY_EMBEDDING_DIM")
+                or mem_raw.get("embedding_dim")
+                or 1024
+            ),
+        )
+
         return cls(
             home_dir=home,
             workspace_dir=_path("METIS_WORKSPACE", "workspace_dir", home / "workspace"),
@@ -82,6 +144,7 @@ class MetisConfig:
             codex_bin=str(codex_override) if codex_override else shutil.which("codex"),
             telegram_enabled=_bool("METIS_TELEGRAM_ENABLED", "telegram_enabled", False),
             cron_enabled=_bool("METIS_CRON_ENABLED", "cron_enabled", False),
+            memory=memory_cfg,
             extra=raw,
         )
 

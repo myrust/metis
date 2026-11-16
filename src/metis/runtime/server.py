@@ -108,7 +108,7 @@ def create_app(
     active_router = router or build_default_router(cfg)
     skills = SkillRegistry(_default_skill_dirs(cfg))
     distiller = SkillDistiller(cfg.skills_dir, provider=None)
-    mnemosyne = memory or MnemosyneMemory(graph_dir=cfg.graph_dir, llm_backend=active_router)
+    mnemosyne = memory or MnemosyneMemory(graph_dir=cfg.graph_dir, memory_config=cfg.memory)
     cron = CronHeartbeatService(enabled=cfg.cron_enabled)
     runner = MetisAgentRunner(
         router=active_router,

@@ -1,41 +1,62 @@
-"""Tests for Mnemosyne graph memory and lightweight CPU embeddings."""
+"""Tests for cloud-API-driven Mnemosyne (Qwen OpenAI-compatible multi-role routing)."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from metis.memory.mnemosyne import MnemosyneMemory, lightweight_cpu_embed
-from metis.providers.base import BaseModelProvider, ProviderRequest, ProviderStreamEvent
+from metis.config import MemoryRoleConfig, MnemosyneConfig
+from metis.memory import mnemosyne as mnemosyne_mod
+from metis.memory.mnemosyne import MnemosyneMemory
 
 
-class _StubProvider(BaseModelProvider):
-    name = "stub"
-
-    def is_available(self) -> bool:
-        return True
-
-    async def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderStreamEvent]:
-        yield ProviderStreamEvent(kind="text_delta", content=f"summary:{request.prompt[:20]}")
-        yield ProviderStreamEvent(kind="done", content="")
-
-
-def test_lightweight_cpu_embed_deterministic_and_unit_norm() -> None:
-    vecs = lightweight_cpu_embed(["Metis knowledge graph", "Metis knowledge graph"], dim=64)
-    assert len(vecs) == 2
-    assert len(vecs[0]) == 64
-    assert vecs[0] == vecs[1]
-    norm_sq = sum(x * x for x in vecs[0])
-    assert abs(norm_sq - 1.0) < 1e-6
+def test_no_local_cpu_embedding_in_mnemosyne() -> None:
+    assert not hasattr(mnemosyne_mod, "lightweight_cpu_embed")
 
 
 @pytest.mark.asyncio
-async def test_mnemosyne_uses_external_dir_and_hephaestus_llm(tmp_path: Path) -> None:
-    graph_dir = tmp_path / "external_graph"
-    memory = MnemosyneMemory(graph_dir=graph_dir, llm_backend=_StubProvider())
-    assert graph_dir.is_dir()
+async def test_mnemosyne_routes_llm_embedding_and_vision_to_openai_compat(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    created_clients: list[dict[str, str | None]] = []
 
-    llm_out = await memory._llm_model_func("Extract entities from Metis.")
-    assert llm_out.startswith("summary:")
+    class _FakeAsyncOpenAI:
+        def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+            created_clients.append({"api_key": api_key, "base_url": base_url})
+            self.chat = MagicMock()
+            self.chat.completions.create = AsyncMock(
+                return_value=SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="cloud-ok"))]
+                )
+            )
+            self.embeddings = MagicMock()
+            self.embeddings.create = AsyncMock(
+                return_value=SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])])
+            )
+
+    monkeypatch.setattr(mnemosyne_mod, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+    cfg = MnemosyneConfig(
+        llm=MemoryRoleConfig("https://dashscope.aliyuncs.com/compatible-mode/v1", "k-llm", "qwen-plus"),
+        embedding=MemoryRoleConfig(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", "k-emb", "text-embedding-v3"
+        ),
+        vision=MemoryRoleConfig(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", "k-vis", "qwen-vl-plus"
+        ),
+        embedding_dim=3,
+    )
+    memory = MnemosyneMemory(graph_dir=tmp_path / "graph", memory_config=cfg)
+
+    llm_res = await memory._llm_model_func("Extract entities")
+    emb_res = await memory._embedding_func(["hello"])
+    vis_res = await memory._vision_model_func("Describe chart", image_data="ZmFrZQ==")
+
+    assert llm_res == "cloud-ok"
+    assert emb_res == [[0.1, 0.2, 0.3]]
+    assert vis_res == "cloud-ok"
+    assert [c["api_key"] for c in created_clients] == ["k-llm", "k-emb", "k-vis"]
