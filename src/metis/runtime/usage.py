@@ -99,11 +99,15 @@ class UsageTracker:
     def summary(self, days: int = 7) -> dict[str, Any]:
         cutoff = time.time() - (days * 86400)
         total_calls = 0
+        ok_calls = 0
         total_in = 0
         total_out = 0
         total_cost = 0.0
         by_model: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        )
+        daily_buckets: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"tokens": 0, "cost_usd": 0.0, "calls": 0}
         )
 
         if self.log_path.is_file():
@@ -114,9 +118,12 @@ class UsageTracker:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if float(rec.get("ts", 0)) < cutoff:
+                ts_val = float(rec.get("ts", 0))
+                if ts_val < cutoff:
                     continue
                 total_calls += 1
+                if rec.get("ok", True):
+                    ok_calls += 1
                 in_t = int(rec.get("input_tokens", 0))
                 out_t = int(rec.get("output_tokens", 0))
                 cost = float(rec.get("cost_usd", 0.0))
@@ -128,12 +135,27 @@ class UsageTracker:
                 by_model[m]["input_tokens"] += in_t
                 by_model[m]["output_tokens"] += out_t
                 by_model[m]["cost_usd"] = round(by_model[m]["cost_usd"] + cost, 6)
+                day_key = time.strftime("%m-%d", time.localtime(ts_val))
+                daily_buckets[day_key]["tokens"] += in_t + out_t
+                daily_buckets[day_key]["cost_usd"] = round(
+                    daily_buckets[day_key]["cost_usd"] + cost, 6
+                )
+                daily_buckets[day_key]["calls"] += 1
+
+        success_rate = round((ok_calls / total_calls) * 100.0, 1) if total_calls else 100.0
+        avg_daily_cost = total_cost / max(1, days)
+        forecast_30d_usd = round(avg_daily_cost * 30.0, 4)
 
         return {
             "days": days,
             "total_calls": total_calls,
+            "success_rate": success_rate,
             "total_input_tokens": total_in,
             "total_output_tokens": total_out,
             "total_cost_usd": round(total_cost, 6),
+            "forecast_30d_usd": forecast_30d_usd,
             "by_model": dict(by_model),
+            "daily": [
+                {"day": k, **v} for k, v in sorted(daily_buckets.items())[-14:]
+            ],
         }

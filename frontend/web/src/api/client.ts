@@ -78,13 +78,16 @@ export interface SystemMetrics {
 export interface UsageSummary {
   days: number
   total_calls: number
+  success_rate: number
   total_input_tokens: number
   total_output_tokens: number
   total_cost_usd: number
+  forecast_30d_usd: number
   by_model: Record<
     string,
     { calls: number; input_tokens: number; output_tokens: number; cost_usd: number }
   >
+  daily: Array<{ day: string; tokens: number; cost_usd: number; calls: number }>
 }
 
 export interface TodoItem {
