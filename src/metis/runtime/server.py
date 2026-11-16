@@ -370,9 +370,13 @@ def create_app(
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    # Optional static frontend mount point (left empty in Phase 1).
-    if cfg.static_dir and cfg.static_dir.is_dir():
-        app.mount("/", StaticFiles(directory=str(cfg.static_dir), html=True), name="static")
+    # Optional static frontend mount point (uses METIS_STATIC_DIR or built frontend/web/dist).
+    default_dist = Path(__file__).resolve().parents[3] / "frontend" / "web" / "dist"
+    static_root = cfg.static_dir if (cfg.static_dir and cfg.static_dir.is_dir()) else (
+        default_dist if default_dist.is_dir() else None
+    )
+    if static_root is not None:
+        app.mount("/", StaticFiles(directory=str(static_root), html=True), name="static")
 
     return app
 

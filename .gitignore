@@ -24,8 +24,10 @@ htmlcov/
 *~
 .python-version
 
-# React TUI frontend
+# React TUI / Web frontend
 frontend/terminal/node_modules/
+frontend/web/node_modules/
+frontend/web/dist/
 
 # User data (never commit API keys or session data)
 .openharness/

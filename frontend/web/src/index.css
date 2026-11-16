@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+.metis-mesh-light {
+  background:
+    radial-gradient(at 10% 85%, rgba(167, 232, 219, 0.72) 0px, transparent 52%),
+    radial-gradient(at 88% 12%, rgba(203, 213, 235, 0.7) 0px, transparent 48%),
+    radial-gradient(at 52% 48%, rgba(235, 238, 245, 0.9) 0px, transparent 65%),
+    linear-gradient(135deg, #e5e8f0 0%, #dbece9 100%);
+}
+
+.metis-mesh-dark {
+  background:
+    radial-gradient(at 12% 85%, rgba(20, 83, 75, 0.55) 0px, transparent 52%),
+    radial-gradient(at 88% 15%, rgba(55, 48, 107, 0.45) 0px, transparent 48%),
+    linear-gradient(135deg, #13151b 0%, #191d26 100%);
+}
+
+.bento-card {
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
